@@ -1,0 +1,29 @@
+# Host tools around the lighthouse kernel (replay, comparison with libsurvive).
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "lh_angles",
+    srcs = ["lh_angles.rs"],
+    deps = ["//kernel:lh_kernel"],
+)
+
+rust_binary(
+    name = "lh_replay",
+    srcs = ["lh_replay.rs"],
+    deps = [
+        "//kernel:lh_kernel",
+        "//protocol:lh_protocol",
+        "@lh_host_crates//:flate2",
+        "@lh_host_crates//:serde_json",
+    ],
+)
+
+rust_binary(
+    name = "lh_protocheck",
+    srcs = ["lh_protocheck.rs"],
+    deps = [
+        "//protocol:lh_protocol",
+        "@lh_host_crates//:flate2",
+        "@lh_host_crates//:serde_json",
+    ],
+)

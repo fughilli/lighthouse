@@ -1,0 +1,21 @@
+# One Vive device over an abstract HID link: the handshake (config readout,
+# startup commands, IMU scales) and report decoding into kernel inputs.
+# no_std + alloc: lhd (hidapi) and the ESP32-P4 player (USB host) share it.
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "lh_device",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    deps = [
+        "//kernel:lh_kernel",
+        "//protocol:lh_protocol",
+    ],
+)
+
+rust_test(
+    name = "lh_device_test",
+    crate = ":lh_device",
+)

@@ -1,0 +1,20 @@
+# Transports for lighthouse devices: live HID (hidapi) and replay of recorded
+# sessions. The only I/O in this repo. See src/lib.rs.
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "lh_transport",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    deps = [
+        "@lh_host_crates//:flate2",
+        "@lh_host_crates//:hidapi",
+    ],
+)
+
+rust_test(
+    name = "lh_transport_test",
+    crate = ":lh_transport",
+)

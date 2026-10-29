@@ -1,0 +1,21 @@
+# Vive / Watchman device protocol: report bytes in, samples out; command bytes.
+# Pure (no I/O). See src/lib.rs and docs/lighthouse-protocol.md.
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "lh_protocol",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    deps = [
+        "//kernel:lh_kernel",
+        "@lh_nostd_crates//:miniz_oxide",
+        "@lh_nostd_crates//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "lh_protocol_test",
+    crate = ":lh_protocol",
+)

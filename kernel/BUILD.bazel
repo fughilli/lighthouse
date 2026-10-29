@@ -1,0 +1,17 @@
+# Lighthouse tracking kernel: no_std + alloc, f64 math via libm (shared with
+# //swarm/core), no I/O. See src/lib.rs.
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "lh_kernel",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    deps = ["@lh_nostd_crates//:libm"],
+)
+
+rust_test(
+    name = "lh_kernel_test",
+    crate = ":lh_kernel",
+)

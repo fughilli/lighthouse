@@ -1,0 +1,8 @@
+# Pinned crate universes (see MODULE.bazel): lh_nostd_crates for the no_std
+# crates, lh_host_crates for the host tools.
+exports_files([
+    "host-Cargo.lock",
+    "host-lock.json",
+    "nostd-Cargo.lock",
+    "nostd-lock.json",
+])

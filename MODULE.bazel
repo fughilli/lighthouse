@@ -1,0 +1,131 @@
+"""Lighthouse 1.0 tracking for Vive Trackers, from raw HID bytes.
+
+kernel, protocol and device are no_std + alloc (they also run on a
+microcontroller, e.g. the ESP32-P4 Splanc player); transport, daemon (lhd) and
+tools are host-side. Consumers depend on this module and use
+@lighthouse//kernel:lh_kernel, //protocol:lh_protocol, //device:lh_device.
+"""
+
+module(
+    name = "lighthouse",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_rust", version = "0.71.3")
+bazel_dep(name = "platforms", version = "1.1.0")
+
+# Toolchains for building this repo on its own (a consumer registers its own).
+# The RISC-V triples are there for the no_std build check (//platforms).
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust", dev_dependency = True)
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.85.0"],
+)
+
+# riscv32imafc (ESP32-P4, hard-float ilp32f) isn't in rules_rust 0.71's triple
+# table, so extra_target_triples rejects it; a repository_set with explicit
+# constraints skips that lookup. One per exec host.
+[
+    rust.repository_set(
+        name = "rust_{}_riscv32imafc".format(exec_name),
+        edition = "2021",
+        exec_triple = exec_triple,
+        target_compatible_with = [
+            "@platforms//cpu:riscv32",
+            "@platforms//os:none",
+        ],
+        target_triple = "riscv32imafc-unknown-none-elf",
+        versions = ["1.85.0"],
+    )
+    for exec_name, exec_triple in [
+        ("macos_aarch64", "aarch64-apple-darwin"),
+        ("macos_x86_64", "x86_64-apple-darwin"),
+        ("linux_aarch64", "aarch64-unknown-linux-gnu"),
+        ("linux_x86_64", "x86_64-unknown-linux-gnu"),
+    ]
+]
+
+use_repo(rust, "rust_toolchains")
+
+register_toolchains(
+    "@rust_toolchains//:all",
+    dev_dependency = True,
+)
+
+# Crates for the no_std crates (kernel, protocol, device): resolved for the
+# hosts AND the bare-metal RISC-V triples. libm for the kernel's f64 math;
+# serde_json's alloc build and miniz_oxide for the device config readout.
+# Repin: CARGO_BAZEL_REPIN=1 bazel query @lh_nostd_crates//:all
+nostd = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+nostd.spec(
+    repositories = ["lh_nostd_crates"],
+    default_features = False,
+    package = "libm",
+    version = "0.2.11",
+)
+nostd.spec(
+    repositories = ["lh_nostd_crates"],
+    default_features = False,
+    features = ["alloc"],
+    package = "serde_json",
+    version = "1.0.128",
+)
+nostd.spec(
+    repositories = ["lh_nostd_crates"],
+    default_features = False,
+    features = ["with-alloc"],
+    package = "miniz_oxide",
+    version = "0.9.1",
+)
+nostd.from_specs(
+    name = "lh_nostd_crates",
+    cargo_lockfile = "//:nostd-Cargo.lock",
+    lockfile = "//:nostd-lock.json",
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        # Bare-metal RISC-V (ESP32-C6; the ESP32-P4 too). rules_rust 0.71 has no
+        # config_setting for riscv32imafc; these crates are pure Rust, and the
+        # riscv32imac setting (cpu:riscv32 + os:none) matches the P4 platform.
+        "riscv32imac-unknown-none-elf",
+    ],
+)
+use_repo(nostd, "lh_nostd_crates")
+
+# Host-only crates (transport, lhd, tools): hidapi (links the system hidapi
+# from Homebrew / libudev), flate2 for .rec.gz recordings, serde_json with std.
+# Repin: CARGO_BAZEL_REPIN=1 bazel query @lh_host_crates//:all
+host = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+host.spec(
+    repositories = ["lh_host_crates"],
+    package = "serde_json",
+    version = "1.0.128",
+)
+host.spec(
+    repositories = ["lh_host_crates"],
+    default_features = False,
+    features = ["rust_backend"],
+    package = "flate2",
+    version = "1.0.34",
+)
+host.spec(
+    repositories = ["lh_host_crates"],
+    default_features = False,
+    features = ["linux-static-hidraw"],
+    package = "hidapi",
+    version = "2.6.3",
+)
+host.from_specs(
+    name = "lh_host_crates",
+    cargo_lockfile = "//:host-Cargo.lock",
+    lockfile = "//:host-lock.json",
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(host, "lh_host_crates")

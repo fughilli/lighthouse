@@ -1,0 +1,12 @@
+# Bare-metal platforms for checking that the no_std crates build for a
+# microcontroller target, e.g.
+#   bazel build --platforms=//platforms:riscv32imafc //kernel //protocol //device
+package(default_visibility = ["//visibility:public"])
+
+platform(
+    name = "riscv32imafc",
+    constraint_values = [
+        "@platforms//cpu:riscv32",
+        "@platforms//os:none",
+    ],
+)
