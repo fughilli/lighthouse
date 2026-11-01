@@ -16,3 +16,20 @@ rust_binary(
         "@lh_host_crates//:serde_json",
     ],
 )
+
+# The same over the f32 kernel: replays a recording the way the ESP32-P4 would
+# track it, for comparing against lhd.
+rust_binary(
+    name = "lhd_f32",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//device:lh_device_f32",
+        "//kernel:lh_kernel_f32",
+        "//protocol:lh_protocol_f32",
+        "//transport:lh_transport",
+        "@lh_host_crates//:flate2",
+        "@lh_host_crates//:serde_json",
+    ],
+)

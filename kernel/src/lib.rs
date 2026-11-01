@@ -10,11 +10,27 @@
 //!                       │
 //!                       └─► sync data bits ─► [`ootx`] ─► station calibration
 //!
-//! Constraints: `no_std` + `alloc`, f64 math through `libm`, so the same code
-//! can run on a host or an embedded target.
+//! Constraints: `no_std` + `alloc`, math through `libm`, so the same code can
+//! run on a host or an embedded target. The scalar is [`Real`]: f64 by default,
+//! f32 with the `f32` feature (for FPUs without doubles, like the ESP32-P4's).
+//! Time stays in integer device ticks, and anything else that needs range
+//! rather than fractions stays integer too.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+#[cfg(feature = "f32")]
+pub type Real = f32;
+#[cfg(not(feature = "f32"))]
+pub type Real = f64;
+
+/// Constants of [`Real`].
+pub mod consts {
+    #[cfg(feature = "f32")]
+    pub use core::f32::consts::*;
+    #[cfg(not(feature = "f32"))]
+    pub use core::f64::consts::*;
+}
 
 pub mod kernel;
 pub mod lh1;

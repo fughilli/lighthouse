@@ -1,45 +1,51 @@
-//! Small f64 geometry: Vec3, unit quaternions, rigid poses. libm for the
-//! transcendental functions so the kernel stays `no_std`.
+//! Small geometry over [`Real`]: Vec3, unit quaternions, rigid poses. libm for
+//! the transcendental functions so the kernel stays `no_std`; each wrapper picks
+//! libm's f32 or Real variant to match [`Real`].
 
-pub fn sqrt(x: f64) -> f64 {
-    libm::sqrt(x)
+pub use crate::Real;
+
+macro_rules! real_fn {
+    ($name:ident, $Real:path, $f32:path, $($a:ident),+) => {
+        #[inline]
+        pub fn $name($($a: Real),+) -> Real {
+            #[cfg(feature = "f32")]
+            return $f32($($a),+);
+            #[cfg(not(feature = "f32"))]
+            return $Real($($a),+);
+        }
+    };
 }
 
-pub fn atan2(y: f64, x: f64) -> f64 {
-    libm::atan2(y, x)
-}
-
-pub fn asin(x: f64) -> f64 {
-    libm::asin(x)
-}
-
-pub fn cos(x: f64) -> f64 {
-    libm::cos(x)
-}
-
-pub fn sin(x: f64) -> f64 {
-    libm::sin(x)
-}
+real_fn!(sqrt, libm::sqrt, libm::sqrtf, x);
+real_fn!(atan2, libm::atan2, libm::atan2f, y, x);
+real_fn!(asin, libm::asin, libm::asinf, x);
+real_fn!(acos, libm::acos, libm::acosf, x);
+real_fn!(cos, libm::cos, libm::cosf, x);
+real_fn!(sin, libm::sin, libm::sinf, x);
+real_fn!(fabs, libm::fabs, libm::fabsf, x);
+real_fn!(floor, libm::floor, libm::floorf, x);
+real_fn!(pow, libm::pow, libm::powf, x, y);
+real_fn!(round, libm::round, libm::roundf, x);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3 {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
+    pub x: Real,
+    pub y: Real,
+    pub z: Real,
 }
 
 impl Vec3 {
     pub const ZERO: Vec3 = Vec3 { x: 0.0, y: 0.0, z: 0.0 };
 
-    pub const fn new(x: f64, y: f64, z: f64) -> Vec3 {
+    pub const fn new(x: Real, y: Real, z: Real) -> Vec3 {
         Vec3 { x, y, z }
     }
 
-    pub fn from_array(a: [f64; 3]) -> Vec3 {
+    pub fn from_array(a: [Real; 3]) -> Vec3 {
         Vec3::new(a[0], a[1], a[2])
     }
 
-    pub fn to_array(self) -> [f64; 3] {
+    pub fn to_array(self) -> [Real; 3] {
         [self.x, self.y, self.z]
     }
 
@@ -51,11 +57,11 @@ impl Vec3 {
         Vec3::new(self.x - o.x, self.y - o.y, self.z - o.z)
     }
 
-    pub fn scale(self, s: f64) -> Vec3 {
+    pub fn scale(self, s: Real) -> Vec3 {
         Vec3::new(self.x * s, self.y * s, self.z * s)
     }
 
-    pub fn dot(self, o: Vec3) -> f64 {
+    pub fn dot(self, o: Vec3) -> Real {
         self.x * o.x + self.y * o.y + self.z * o.z
     }
 
@@ -63,7 +69,7 @@ impl Vec3 {
         Vec3::new(self.y * o.z - self.z * o.y, self.z * o.x - self.x * o.z, self.x * o.y - self.y * o.x)
     }
 
-    pub fn norm(self) -> f64 {
+    pub fn norm(self) -> Real {
         sqrt(self.dot(self))
     }
 
@@ -80,10 +86,10 @@ impl Vec3 {
 /// Unit quaternion, scalar first.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quat {
-    pub w: f64,
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
+    pub w: Real,
+    pub x: Real,
+    pub y: Real,
+    pub z: Real,
 }
 
 impl Default for Quat {
@@ -95,7 +101,7 @@ impl Default for Quat {
 impl Quat {
     pub const IDENTITY: Quat = Quat { w: 1.0, x: 0.0, y: 0.0, z: 0.0 };
 
-    pub const fn new(w: f64, x: f64, y: f64, z: f64) -> Quat {
+    pub const fn new(w: Real, x: Real, y: Real, z: Real) -> Quat {
         Quat { w, x, y, z }
     }
 
@@ -171,7 +177,7 @@ mod tests {
         let v = Vec3::new(0.2, 0.4, -0.9);
         let back = p.inverse().apply(p.apply(v));
         assert!(back.sub(v).norm() < 1e-12);
-        let q = Quat::from_rotvec(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_2));
+        let q = Quat::from_rotvec(Vec3::new(0.0, 0.0, crate::consts::FRAC_PI_2));
         let r = q.rotate(Vec3::new(1.0, 0.0, 0.0));
         assert!(r.sub(Vec3::new(0.0, 1.0, 0.0)).norm() < 1e-12);
     }

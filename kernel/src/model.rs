@@ -9,6 +9,7 @@
 //! Perturbations are on the right for rotation and additive for position:
 //! `R ← R·exp(δθ)`, `p ← p + δp`. Jacobians are rows over (δp, δθ).
 
+use crate::Real;
 use crate::lh1::{project, AxisCal};
 use crate::linalg::{mat3_vec, rot_mat, skew, vec_mat3};
 use crate::math::{Pose, Vec3};
@@ -33,11 +34,11 @@ pub struct StationModel {
 /// One sweep-angle measurement's prediction and gradients.
 #[derive(Clone, Copy, Debug)]
 pub struct AngleJacobian {
-    pub angle: f64,
+    pub angle: Real,
     /// d angle / d (δp, δθ) of the tracker's world_from_body.
-    pub tracker: [f64; 6],
+    pub tracker: [Real; 6],
     /// d angle / d (δp, δθ) of the station's world_from_station.
-    pub station: [f64; 6],
+    pub station: [Real; 6],
     /// The sensor in the station frame (for visibility checks).
     pub in_station: Vec3,
 }
@@ -66,7 +67,7 @@ pub fn predict(station: &StationModel, world_from_body: &Pose, sensor: Vec3, axi
 }
 
 /// Applies a (δp, δθ) correction to a pose.
-pub fn retract(p: &Pose, d: &[f64]) -> Pose {
+pub fn retract(p: &Pose, d: &[Real]) -> Pose {
     use crate::math::Quat;
     Pose {
         pos: p.pos.add(Vec3::new(d[0], d[1], d[2])),

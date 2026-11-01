@@ -7,6 +7,7 @@
 //! the tracker's accelerometer while still and each station's OOTX accel
 //! vector must point along world +z.
 
+use crate::Real;
 use crate::linalg::{rot_mat, skew, Mat};
 use crate::math::{Pose, Quat, Vec3};
 use crate::model::{predict, retract, StationModel, TrackerModel};
@@ -19,19 +20,19 @@ pub struct Obs {
     pub station: usize,
     pub axis: u8,
     pub sensor: u16,
-    pub angle: f64,
+    pub angle: Real,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SolveConfig {
     /// Angle noise (rad, 1σ).
-    pub sigma_angle: f64,
+    pub sigma_angle: Real,
     /// Tracker gravity direction noise while still (rad).
-    pub sigma_tracker_up: f64,
+    pub sigma_tracker_up: Real,
     /// Station OOTX gravity direction noise (rad; the vector is 8-bit).
-    pub sigma_station_up: f64,
+    pub sigma_station_up: Real,
     /// Huber threshold, in σ.
-    pub huber: f64,
+    pub huber: Real,
     pub max_iterations: usize,
 }
 
@@ -41,8 +42,8 @@ impl Default for SolveConfig {
     }
 }
 
-fn huber_weight(r: f64, k: f64) -> f64 {
-    let a = libm::fabs(r);
+fn huber_weight(r: Real, k: Real) -> Real {
+    let a = crate::math::fabs(r);
     if a <= k {
         1.0
     } else {
@@ -54,8 +55,8 @@ fn huber_weight(r: f64, k: f64) -> f64 {
 struct Rows {
     n: usize,
     jtj: Mat,
-    jtr: Vec<f64>,
-    cost: f64,
+    jtr: Vec<Real>,
+    cost: Real,
     count: usize,
 }
 
@@ -65,7 +66,7 @@ impl Rows {
     }
 
     /// Adds a residual (already divided by its σ) with sparse Jacobian entries.
-    fn add(&mut self, r: f64, j: &[(usize, f64)], huber: Option<f64>) {
+    fn add(&mut self, r: Real, j: &[(usize, Real)], huber: Option<Real>) {
         let w = huber.map_or(1.0, |k| huber_weight(r, k));
         for &(a, ja) in j {
             self.jtr[a] += w * ja * r;
@@ -75,14 +76,14 @@ impl Rows {
         }
         // Huber cost.
         self.cost += match huber {
-            Some(k) if libm::fabs(r) > k => k * (2.0 * libm::fabs(r) - k),
+            Some(k) if crate::math::fabs(r) > k => k * (2.0 * crate::math::fabs(r) - k),
             _ => r * r,
         };
         self.count += 1;
     }
 
     /// LM step: (JᵀWJ + λ diag) δ = -JᵀWr.
-    fn step(&self, lambda: f64) -> Option<Vec<f64>> {
+    fn step(&self, lambda: Real) -> Option<Vec<Real>> {
         let mut a = self.jtj.clone();
         for i in 0..self.n {
             a[(i, i)] += lambda * (a[(i, i)] + 1e-9);
@@ -95,7 +96,7 @@ impl Rows {
 /// Gravity residual: R·a (unit) should be +z; residual = R·a - z (all three
 /// components, so upside down is as wrong as it looks). Returns the residual
 /// and its d/dθ rows for a right perturbation of R.
-fn up_residual(r: Quat, a: Vec3) -> ([f64; 3], [[f64; 3]; 3]) {
+fn up_residual(r: Quat, a: Vec3) -> ([Real; 3], [[Real; 3]; 3]) {
     let rm = rot_mat(r);
     let up = r.rotate(a.normalized());
     // d(R exp(δθ) a)/dθ = -R [a]x
@@ -121,7 +122,7 @@ pub struct PoseSolution {
     /// 6x6 over (δp, δθ).
     pub cov: Mat,
     /// RMS angle residual over inliers (rad).
-    pub rms: f64,
+    pub rms: Real,
     pub inliers: usize,
     pub obs: usize,
 }
@@ -139,13 +140,13 @@ fn pose_rows(
         let st = &stations[o.station];
         let j = predict(st, pose, model.sensors[o.sensor as usize], o.axis);
         let r = (j.angle - o.angle) / cfg.sigma_angle;
-        let jr: Vec<(usize, f64)> = (0..6).map(|k| (k, j.tracker[k] / cfg.sigma_angle)).collect();
+        let jr: Vec<(usize, Real)> = (0..6).map(|k| (k, j.tracker[k] / cfg.sigma_angle)).collect();
         rows.add(r, &jr, Some(cfg.huber));
     }
     if let Some(a) = up_body {
         let (r, d) = up_residual(pose.rot, a);
         for i in 0..3 {
-            let jr: Vec<(usize, f64)> = (0..3).map(|k| (3 + k, d[i][k] / cfg.sigma_tracker_up)).collect();
+            let jr: Vec<(usize, Real)> = (0..3).map(|k| (3 + k, d[i][k] / cfg.sigma_tracker_up)).collect();
             rows.add(r[i] / cfg.sigma_tracker_up, &jr, None);
         }
     }
@@ -169,7 +170,7 @@ pub fn refine_pose(
         let cand = retract(&pose, &d);
         let crow = pose_rows(model, stations, obs, up_body, &cand, cfg);
         if crow.cost < rows.cost {
-            let done = d.iter().map(|x| x * x).sum::<f64>() < 1e-16;
+            let done = d.iter().map(|x| x * x).sum::<Real>() < 1e-16;
             pose = cand;
             rows = crow;
             lambda = (lambda * 0.3).max(1e-9);
@@ -189,7 +190,7 @@ pub fn refine_pose(
     for o in obs {
         let j = predict(&stations[o.station], &pose, model.sensors[o.sensor as usize], o.axis);
         let r = j.angle - o.angle;
-        if libm::fabs(r) <= cfg.huber * cfg.sigma_angle {
+        if crate::math::fabs(r) <= cfg.huber * cfg.sigma_angle {
             sum += r * r;
             inl += 1;
         }
@@ -197,7 +198,7 @@ pub fn refine_pose(
     Some(PoseSolution {
         world_from_body: pose,
         cov,
-        rms: if inl > 0 { libm::sqrt(sum / inl as f64) } else { f64::INFINITY },
+        rms: if inl > 0 { crate::math::sqrt(sum / inl as Real) } else { Real::INFINITY },
         inliers: inl,
         obs: obs.len(),
     })
@@ -229,7 +230,7 @@ pub fn bootstrap_pose(
         for range in [0.3, 0.8, 1.6, 3.0] {
             let pos = st.world_from_station.pos.add(ahead.scale(range));
             for yaw in 0..8 {
-                let q = Quat::from_rotvec(Vec3::new(0.0, 0.0, yaw as f64 * core::f64::consts::FRAC_PI_4)).mul(level);
+                let q = Quat::from_rotvec(Vec3::new(0.0, 0.0, yaw as Real * crate::consts::FRAC_PI_4)).mul(level);
                 if let Some(s) = refine_pose(model, stations, obs, up_body, Pose { pos, rot: q }, cfg) {
                     let better = match &best {
                         None => true,
@@ -257,7 +258,7 @@ pub fn station_disagreement(
     up_body: Vec3,
     min_sensors: usize,
     cfg: &SolveConfig,
-) -> Option<(f64, f64)> {
+) -> Option<(Real, Real)> {
     let mut poses: Vec<Pose> = Vec::new();
     for (si, st) in stations.iter().enumerate() {
         let mine: Vec<Obs> = obs.iter().filter(|o| o.station == si).map(|o| Obs { station: 0, ..*o }).collect();
@@ -278,12 +279,12 @@ pub fn station_disagreement(
     if poses.len() < 2 {
         return None;
     }
-    let (mut dp, mut dr) = (0.0f64, 0.0f64);
+    let (mut dp, mut dr) = (0.0 as Real, 0.0 as Real);
     for i in 0..poses.len() {
         for j in i + 1..poses.len() {
             dp = dp.max(poses[i].pos.sub(poses[j].pos).norm());
-            let w = libm::fabs(poses[i].rot.conj().mul(poses[j].rot).w).min(1.0);
-            dr = dr.max(2.0 * libm::acos(w));
+            let w = crate::math::fabs(poses[i].rot.conj().mul(poses[j].rot).w).min(1.0);
+            dr = dr.max(2.0 * crate::math::acos(w));
         }
     }
     Some((dp, dr))
@@ -296,7 +297,7 @@ pub struct CandidateObs {
     pub station: usize,
     pub axis: u8,
     pub sensor: u16,
-    pub angles: Vec<f64>,
+    pub angles: Vec<Real>,
 }
 
 /// Bootstrap with data association: start from each key's first candidate,
@@ -307,7 +308,7 @@ pub fn bootstrap_pose_assoc(
     stations: &[StationModel],
     cands: &[CandidateObs],
     up_body: Option<Vec3>,
-    reject: f64,
+    reject: Real,
     cfg: &SolveConfig,
 ) -> Option<PoseSolution> {
     let first: Vec<Obs> =
@@ -317,9 +318,9 @@ pub fn bootstrap_pose_assoc(
         let mut obs = Vec::new();
         for c in cands {
             let p = predict(&stations[c.station], &sol.world_from_body, model.sensors[c.sensor as usize], c.axis);
-            let best = c.angles.iter().copied().min_by(|a, b| libm::fabs(a - p.angle).partial_cmp(&libm::fabs(b - p.angle)).unwrap());
+            let best = c.angles.iter().copied().min_by(|a, b| crate::math::fabs(a - p.angle).partial_cmp(&crate::math::fabs(b - p.angle)).unwrap());
             if let Some(a) = best {
-                if libm::fabs(a - p.angle) <= reject {
+                if crate::math::fabs(a - p.angle) <= reject {
                     obs.push(Obs { station: c.station, axis: c.axis, sensor: c.sensor, angle: a });
                 }
             }
@@ -340,11 +341,11 @@ pub fn bootstrap_pose_assoc(
 /// Rotation vector of a unit quaternion (log map).
 pub fn rotvec(q: Quat) -> Vec3 {
     let q = if q.w < 0.0 { Quat::new(-q.w, -q.x, -q.y, -q.z) } else { q };
-    let s = libm::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
+    let s = crate::math::sqrt(q.x * q.x + q.y * q.y + q.z * q.z);
     if s < 1e-12 {
         return Vec3::new(2.0 * q.x, 2.0 * q.y, 2.0 * q.z);
     }
-    let angle = 2.0 * libm::atan2(s, q.w);
+    let angle = 2.0 * crate::math::atan2(s, q.w);
     Vec3::new(q.x, q.y, q.z).scale(angle / s)
 }
 
@@ -354,8 +355,8 @@ pub fn quat_between(a: Vec3, b: Vec3) -> Quat {
     let d = a.dot(b);
     if d < -0.999999 {
         // Opposite: any perpendicular axis.
-        let axis = if libm::fabs(a.x) < 0.9 { a.cross(Vec3::new(1.0, 0.0, 0.0)) } else { a.cross(Vec3::new(0.0, 1.0, 0.0)) };
-        return Quat::from_rotvec(axis.normalized().scale(core::f64::consts::PI));
+        let axis = if crate::math::fabs(a.x) < 0.9 { a.cross(Vec3::new(1.0, 0.0, 0.0)) } else { a.cross(Vec3::new(0.0, 1.0, 0.0)) };
+        return Quat::from_rotvec(axis.normalized().scale(crate::consts::PI));
     }
     Quat::new(1.0 + d, c.x, c.y, c.z).normalized()
 }
@@ -371,14 +372,14 @@ pub fn bootstrap_station(
     obs: &[Obs],
     up_station: Option<Vec3>,
     cfg: &SolveConfig,
-) -> Option<(StationModel, f64)> {
+) -> Option<(StationModel, Real)> {
     let target = world_from_body.pos;
-    let mut best: Option<(StationModel, f64, usize)> = None;
+    let mut best: Option<(StationModel, Real, usize)> = None;
     for range in [0.5, 1.0, 2.0, 3.5] {
         for el in [-0.3, 0.3, 0.8] {
             for az in 0..12 {
-                let azr = az as f64 * core::f64::consts::PI / 6.0;
-                let dir = Vec3::new(libm::cos(el) * libm::cos(azr), libm::cos(el) * libm::sin(azr), libm::sin(el));
+                let azr = az as Real * crate::consts::PI / 6.0;
+                let dir = Vec3::new(crate::math::cos(el) * crate::math::cos(azr), crate::math::cos(el) * crate::math::sin(azr), crate::math::sin(el));
                 let pos = target.add(dir.scale(range));
                 let st = StationModel { cal, world_from_station: look_at(pos, target) };
                 if let Some((s, cost, inl)) = refine_station(model, st, world_from_body, obs, up_station, cfg) {
@@ -408,16 +409,16 @@ pub fn quat_from_columns(x: Vec3, y: Vec3, z: Vec3) -> Quat {
     let m = [[x.x, y.x, z.x], [x.y, y.y, z.y], [x.z, y.z, z.z]];
     let tr = m[0][0] + m[1][1] + m[2][2];
     let q = if tr > 0.0 {
-        let s = libm::sqrt(tr + 1.0) * 2.0;
+        let s = crate::math::sqrt(tr + 1.0) * 2.0;
         Quat::new(0.25 * s, (m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s)
     } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
-        let s = libm::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
+        let s = crate::math::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0;
         Quat::new((m[2][1] - m[1][2]) / s, 0.25 * s, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s)
     } else if m[1][1] > m[2][2] {
-        let s = libm::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
+        let s = crate::math::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0;
         Quat::new((m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s)
     } else {
-        let s = libm::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
+        let s = crate::math::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0;
         Quat::new((m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s)
     };
     q.normalized()
@@ -430,18 +431,18 @@ fn refine_station(
     obs: &[Obs],
     up_station: Option<Vec3>,
     cfg: &SolveConfig,
-) -> Option<(StationModel, f64, usize)> {
+) -> Option<(StationModel, Real, usize)> {
     let rows_for = |st: &StationModel| -> Rows {
         let mut rows = Rows::new(6);
         for o in obs {
             let p = predict(st, world_from_body, model.sensors[o.sensor as usize], o.axis);
-            let jr: Vec<(usize, f64)> = (0..6).map(|k| (k, p.station[k] / cfg.sigma_angle)).collect();
+            let jr: Vec<(usize, Real)> = (0..6).map(|k| (k, p.station[k] / cfg.sigma_angle)).collect();
             rows.add((p.angle - o.angle) / cfg.sigma_angle, &jr, Some(cfg.huber));
         }
         if let Some(a) = up_station {
             let (r, d) = up_residual(st.world_from_station.rot, a);
             for i in 0..3 {
-                let jr: Vec<(usize, f64)> = (0..3).map(|k| (3 + k, d[i][k] / cfg.sigma_station_up)).collect();
+                let jr: Vec<(usize, Real)> = (0..3).map(|k| (3 + k, d[i][k] / cfg.sigma_station_up)).collect();
                 rows.add(r[i] / cfg.sigma_station_up, &jr, None);
             }
         }
@@ -471,7 +472,7 @@ fn refine_station(
         .iter()
         .filter(|o| {
             let p = predict(&st, world_from_body, model.sensors[o.sensor as usize], o.axis);
-            p.in_station.z < 0.0 && libm::fabs(p.angle - o.angle) < cfg.huber * cfg.sigma_angle
+            p.in_station.z < 0.0 && crate::math::fabs(p.angle - o.angle) < cfg.huber * cfg.sigma_angle
         })
         .count();
     Some((st, rows.cost, inl))
@@ -499,10 +500,10 @@ pub struct Calibration {
     /// station's position and heading fixed).
     pub station_cov: Vec<Mat>,
     /// Per station: RMS angle residual (rad) over inliers.
-    pub rms: Vec<f64>,
+    pub rms: Vec<Real>,
     /// Gravity disagreement (rad) per station and mean over scenes.
-    pub station_up_error: Vec<f64>,
-    pub tracker_up_error: f64,
+    pub station_up_error: Vec<Real>,
+    pub tracker_up_error: Real,
     pub dropped: usize,
 }
 
@@ -511,8 +512,8 @@ pub struct Calibration {
 #[derive(Clone, Copy, Debug)]
 pub struct StationPrior {
     pub pose: Pose,
-    pub sigma_pos: f64,
-    pub sigma_rot: f64,
+    pub sigma_pos: Real,
+    pub sigma_rot: Real,
 }
 
 /// Jointly refines station poses (all but `reference`, which keeps its
@@ -527,7 +528,7 @@ pub fn calibrate(
     scenes_init: &[Scene],
     reference: usize,
     cfg: &SolveConfig,
-    reject: f64,
+    reject: Real,
 ) -> Option<Calibration> {
     let ns = stations_init.len();
     let free: Vec<usize> = (0..ns).filter(|&i| i != reference).collect();
@@ -559,7 +560,7 @@ pub fn calibrate(
                 let st = &stations[o.station];
                 let p = predict(st, sc, model.sensors[o.sensor as usize], o.axis);
                 let r = (p.angle - o.angle) / cfg.sigma_angle;
-                let mut jr: Vec<(usize, f64)> = (0..6).map(|k| (sc_off(j) + k, p.tracker[k] / cfg.sigma_angle)).collect();
+                let mut jr: Vec<(usize, Real)> = (0..6).map(|k| (sc_off(j) + k, p.tracker[k] / cfg.sigma_angle)).collect();
                 match st_off(o.station) {
                     Some(off) => jr.extend((0..6).map(|k| (off + k, p.station[k] / cfg.sigma_angle))),
                     None => {
@@ -584,7 +585,7 @@ pub fn calibrate(
             }
             let (r, d) = up_residual(sc.rot, scenes_init[j].up_body);
             for i in 0..3 {
-                let jr: Vec<(usize, f64)> = (0..3).map(|k| (sc_off(j) + 3 + k, d[i][k] / cfg.sigma_tracker_up)).collect();
+                let jr: Vec<(usize, Real)> = (0..3).map(|k| (sc_off(j) + 3 + k, d[i][k] / cfg.sigma_tracker_up)).collect();
                 rows.add(r[i] / cfg.sigma_tracker_up, &jr, None);
             }
         }
@@ -603,7 +604,7 @@ pub fn calibrate(
             if let Some(a) = station_up[i] {
                 let (r, d) = up_residual(st.world_from_station.rot, a);
                 for k in 0..3 {
-                    let jr: Vec<(usize, f64)> = match st_off(i) {
+                    let jr: Vec<(usize, Real)> = match st_off(i) {
                         Some(off) => (0..3).map(|c| (off + 3 + c, d[k][c] / cfg.sigma_station_up)).collect(),
                         None => {
                             let rt = rot_mat(st.world_from_station.rot);
@@ -625,7 +626,7 @@ pub fn calibrate(
         rows
     };
 
-    let apply = |stations: &[StationModel], scenes: &[Pose], d: &[f64]| -> (Vec<StationModel>, Vec<Pose>) {
+    let apply = |stations: &[StationModel], scenes: &[Pose], d: &[Real]| -> (Vec<StationModel>, Vec<Pose>) {
         let mut st = stations.to_vec();
         let tilt = Quat::from_rotvec(Vec3::new(d[0], d[1], 0.0));
         for (i, s) in st.iter_mut().enumerate() {
@@ -649,7 +650,7 @@ pub fn calibrate(
             let (cs, cc) = apply(&stations, &scenes, &d);
             let crow = build(&cs, &cc, &obs);
             if crow.cost < rows.cost {
-                let small = d.iter().map(|x| x * x).sum::<f64>() < 1e-18;
+                let small = d.iter().map(|x| x * x).sum::<Real>() < 1e-18;
                 stations = cs;
                 scenes = cc;
                 rows = crow;
@@ -677,7 +678,7 @@ pub fn calibrate(
                     .filter(|c| key(c) == key(&o))
                     .map(|c| {
                         let p = predict(&stations[c.station], sc, model.sensors[c.sensor as usize], c.axis);
-                        (*c, libm::fabs(p.angle - c.angle))
+                        (*c, crate::math::fabs(p.angle - c.angle))
                     })
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                     .unwrap();
@@ -722,11 +723,11 @@ pub fn calibrate(
         }
     }
     for i in 0..ns {
-        rms[i] = if cnt[i] > 0 { libm::sqrt(rms[i] / cnt[i] as f64) } else { f64::NAN };
+        rms[i] = if cnt[i] > 0 { crate::math::sqrt(rms[i] / cnt[i] as Real) } else { Real::NAN };
     }
-    let tilt_of = |q: Quat, a: Vec3| libm::acos(q.rotate(a.normalized()).z.clamp(-1.0, 1.0));
-    let station_up_error = (0..ns).map(|i| station_up[i].map_or(f64::NAN, |a| tilt_of(stations[i].world_from_station.rot, a))).collect();
-    let tracker_up_error = scenes.iter().zip(scenes_init).map(|(p, s)| tilt_of(p.rot, s.up_body)).sum::<f64>() / scenes.len().max(1) as f64;
+    let tilt_of = |q: Quat, a: Vec3| crate::math::acos(q.rotate(a.normalized()).z.clamp(-1.0, 1.0));
+    let station_up_error = (0..ns).map(|i| station_up[i].map_or(Real::NAN, |a| tilt_of(stations[i].world_from_station.rot, a))).collect();
+    let tracker_up_error = scenes.iter().zip(scenes_init).map(|(p, s)| tilt_of(p.rot, s.up_body)).sum::<Real>() / scenes.len().max(1) as Real;
     Some(Calibration { stations, scenes, station_cov, rms, station_up_error, tracker_up_error, dropped })
 }
 
@@ -740,10 +741,10 @@ mod tests {
         let mut sensors = Vec::new();
         let mut normals = Vec::new();
         for i in 0..16 {
-            let a = i as f64 * core::f64::consts::PI / 8.0;
+            let a = i as Real * crate::consts::PI / 8.0;
             let z = if i % 2 == 0 { 0.0 } else { 0.015 };
-            sensors.push(Vec3::new(0.04 * libm::cos(a), 0.04 * libm::sin(a), z));
-            normals.push(Vec3::new(libm::cos(a), libm::sin(a), 0.5).normalized());
+            sensors.push(Vec3::new(0.04 * crate::math::cos(a), 0.04 * crate::math::sin(a), z));
+            normals.push(Vec3::new(crate::math::cos(a), crate::math::sin(a), 0.5).normalized());
         }
         TrackerModel { sensors, normals, body_from_head: Pose::IDENTITY }
     }
@@ -758,7 +759,7 @@ mod tests {
             let y = z.cross(x);
             // Rotation with columns x, y, z.
             let m = [[x.x, y.x, z.x], [x.y, y.y, z.y], [x.z, y.z, z.z]];
-            let w = libm::sqrt((1.0 + m[0][0] + m[1][1] + m[2][2]).max(1e-12)) / 2.0;
+            let w = crate::math::sqrt((1.0 + m[0][0] + m[1][1] + m[2][2]).max(1e-12)) / 2.0;
             let q = Quat::new(w, (m[2][1] - m[1][2]) / (4.0 * w), (m[0][2] - m[2][0]) / (4.0 * w), (m[1][0] - m[0][1]) / (4.0 * w));
             Pose { pos, rot: q.normalized() }
         };
