@@ -343,6 +343,9 @@ fn main() {
     for (name, &id) in &devs {
         if let Some(ts) = kernel.timing_stats(id) {
             eprintln!("timing {}: {} sweeps, {} early, {} late sweep pulses", name, ts.sweeps, ts.early_sweeps, ts.late_sweep_pulses);
+            if args.iter().any(|a| a == "--timing-stats") {
+                eprintln!("timing {}: {:?}", name, ts);
+            }
         }
     }
     // Innovation statistics per (station, axis) since the last report.

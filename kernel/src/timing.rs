@@ -167,6 +167,9 @@ struct WidthCal {
     cos_sum: Real,
     votes: [u32; 3],
     cycles: u32,
+    /// Per shift: cycles with a sync that contradicted it, and cycles with any sync.
+    viol: [u32; 3],
+    seen: u32,
     shift: Option<i32>,
 }
 
@@ -203,6 +206,10 @@ impl WidthCal {
     /// right shift: both syncs of a cycle name the same axis and exactly one
     /// skips; per station, the skip bit toggles exactly when the axis goes
     /// from 1 back to 0 (b/c sequence 4,5,0,1); a lone station never skips.
+    ///
+    /// A lone station only rules a wrong shift out when its sync would read as a skip,
+    /// one cycle in four, so the right shift outvotes the next only 4:3; it's taken
+    /// instead once it has (almost) never been contradicted and both others often.
     fn vote(&mut self, raw: [Option<i32>; 2], prev_raw: [Option<i32>; 2]) {
         if self.shift.is_some() {
             return;
@@ -229,14 +236,26 @@ impl WidthCal {
             }
             if ok {
                 self.votes[i] += 1;
+            } else if raw[0].is_some() || raw[1].is_some() {
+                self.viol[i] += 1;
             }
         }
         self.cycles += 1;
+        if raw[0].is_some() || raw[1].is_some() {
+            self.seen += 1;
+        }
         if self.cycles >= 8 {
             let best = (0..3).max_by_key(|&i| self.votes[i]).unwrap();
             let second = (0..3).filter(|&i| i != best).map(|i| self.votes[i]).max().unwrap();
             if self.votes[best] >= 6 && self.votes[best] >= 2 * second.max(1) {
                 self.shift = Some(best as i32 - 1);
+            } else if self.seen >= 16 {
+                let clean: Vec<usize> = (0..3).filter(|&i| self.viol[i] <= 1).collect();
+                if let [i] = clean[..] {
+                    if (0..3).all(|j| j == i || self.viol[j] >= 3) {
+                        self.shift = Some(i as i32 - 1);
+                    }
+                }
             }
         }
     }
@@ -1120,6 +1139,43 @@ mod tests {
             }
         }
         assert!(saw_reflection);
+    }
+
+    /// A lone station (mode A): one sync per cycle in slot 0, never skipping, the axis
+    /// alternating, OOTX in the data bit; widths off the nominal grid as a wired tracker
+    /// reports them (+350 ticks, so the whole code step has to be learned).
+    fn lone_stream(cycles: u32, data: &[bool]) -> Vec<Pulse> {
+        let mut v = Vec::new();
+        let base: u32 = 4_294_000_000;
+        for k in 0..cycles {
+            let t0 = base.wrapping_add(k * CYCLE_TICKS);
+            let bit = data.get(k as usize).copied().unwrap_or(false);
+            let c = SyncCode { skip: false, data: bit, axis: (k % 2) as u8 };
+            for s in 0..8u8 {
+                v.push(Pulse { sensor: s, start: t0.wrapping_add(s as u32 * 3), len: c.nominal_ticks() + 350 });
+            }
+            for s in 0..6u8 {
+                v.push(Pulse { sensor: s, start: t0.wrapping_add(200_000 + s as u32 * 1_000 - 400), len: 800 });
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn lone_station_locks_decodes_and_sweeps() {
+        let mut data = ootx_frame(0x1234_5678);
+        data.extend(ootx_frame(0x1234_5678));
+        let (out, t) = run(&lone_stream(data.len() as u32 + 20, &data), TimingConfig::default());
+        assert_eq!(t.stats.locks, 1, "{:?}", t.stats);
+        assert_eq!(t.stats.lock_losses, 0, "{:?}", t.stats);
+        let sweeps: Vec<&Sweep> =
+            out.iter().filter_map(|e| if let TimingEvent::Sweep(s) = e { Some(s) } else { None }).collect();
+        assert!(sweeps.len() > data.len() / 2, "{} sweeps, {:?}", sweeps.len(), t.stats);
+        assert!(sweeps.iter().all(|s| s.slot == 0));
+        for axis in 0..2 {
+            assert!(sweeps.iter().any(|s| s.axis == axis));
+        }
+        assert!(out.iter().any(|e| matches!(e, TimingEvent::Station { slot: 0, .. })), "no OOTX station");
     }
 
     #[test]
