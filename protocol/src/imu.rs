@@ -4,19 +4,20 @@
 //!   gyro_rps = (raw * gyro_range/32768 * pi/180 - gyro_bias) * gyro_scale
 
 use crate::RawImu;
+use lh_kernel::Real;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImuCalibration {
     /// g per count.
-    pub acc_per_count: f64,
+    pub acc_per_count: Real,
     /// rad/s per count.
-    pub gyro_per_count: f64,
+    pub gyro_per_count: Real,
     /// g (the config gives milli-g).
-    pub acc_bias: [f64; 3],
-    pub acc_scale: [f64; 3],
+    pub acc_bias: [Real; 3],
+    pub acc_scale: [Real; 3],
     /// rad/s.
-    pub gyro_bias: [f64; 3],
-    pub gyro_scale: [f64; 3],
+    pub gyro_bias: [Real; 3],
+    pub gyro_scale: [Real; 3],
 }
 
 impl Default for ImuCalibration {
@@ -24,7 +25,7 @@ impl Default for ImuCalibration {
     fn default() -> ImuCalibration {
         ImuCalibration {
             acc_per_count: 8.0 / 32768.0,
-            gyro_per_count: 2000.0 / 32768.0 * core::f64::consts::PI / 180.0,
+            gyro_per_count: 2000.0 / 32768.0 * lh_kernel::consts::PI / 180.0,
             acc_bias: [0.0; 3],
             acc_scale: [1.0; 3],
             gyro_bias: [0.0; 3],
@@ -39,16 +40,16 @@ impl ImuCalibration {
         let gyro_range = [250.0, 500.0, 1000.0, 2000.0][(gyro_mode & 3) as usize];
         let acc_range = [2.0, 4.0, 8.0, 16.0][(acc_mode & 3) as usize];
         self.acc_per_count = acc_range / 32768.0;
-        self.gyro_per_count = gyro_range / 32768.0 * core::f64::consts::PI / 180.0;
+        self.gyro_per_count = gyro_range / 32768.0 * lh_kernel::consts::PI / 180.0;
     }
 
     /// (accel in g, gyro in rad/s), IMU frame.
-    pub fn apply(&self, s: &RawImu) -> ([f64; 3], [f64; 3]) {
+    pub fn apply(&self, s: &RawImu) -> ([Real; 3], [Real; 3]) {
         let mut a = [0.0; 3];
         let mut g = [0.0; 3];
         for i in 0..3 {
-            a[i] = (s.accel[i] as f64 * self.acc_per_count - self.acc_bias[i]) * self.acc_scale[i];
-            g[i] = (s.gyro[i] as f64 * self.gyro_per_count - self.gyro_bias[i]) * self.gyro_scale[i];
+            a[i] = (s.accel[i] as Real * self.acc_per_count - self.acc_bias[i]) * self.acc_scale[i];
+            g[i] = (s.gyro[i] as Real * self.gyro_per_count - self.gyro_bias[i]) * self.gyro_scale[i];
         }
         (a, g)
     }

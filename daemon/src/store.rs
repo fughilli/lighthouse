@@ -8,6 +8,7 @@ use lh_kernel::kernel::{Event, Input};
 use lh_kernel::lh1::AxisCal;
 use lh_kernel::linalg::Mat;
 use lh_kernel::math::{Pose, Quat, Vec3};
+use lh_kernel::Real;
 use serde_json::{json, Value};
 
 pub fn load(path: &str) -> Result<Vec<Input>, String> {
@@ -15,12 +16,12 @@ pub fn load(path: &str) -> Result<Vec<Input>, String> {
     let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for s in v["stations"].as_array().ok_or("no stations")? {
-        let f = |x: &Value| x.as_f64().unwrap_or(0.0);
-        let p: Vec<f64> = s["pose"].as_array().ok_or("pose")?.iter().map(f).collect();
-        let cov: Vec<f64> = s["cov"].as_array().ok_or("cov")?.iter().map(f).collect();
+        let f = |x: &Value| x.as_f64().unwrap_or(0.0) as Real;
+        let p: Vec<Real> = s["pose"].as_array().ok_or("pose")?.iter().map(f).collect();
+        let cov: Vec<Real> = s["cov"].as_array().ok_or("cov")?.iter().map(f).collect();
         let cal_v = s["cal"].as_array().ok_or("cal")?;
         let axis = |a: &Value| {
-            let c: Vec<f64> = a.as_array().map(|x| x.iter().map(f).collect()).unwrap_or_default();
+            let c: Vec<Real> = a.as_array().map(|x| x.iter().map(f).collect()).unwrap_or_default();
             AxisCal { phase: c[0], tilt: c[1], curve: c[2], gibphase: c[3], gibmag: c[4] }
         };
         out.push(Input::StationPrior {

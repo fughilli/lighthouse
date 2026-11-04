@@ -3,7 +3,16 @@
 //! apply) plus the kernel's events as JSON lines.
 //!
 //!   lh_replay captures/vive/X.rec.gz --out poses.txt [--events events.jsonl]
-//!             [--stations libsurvive-config.json] [--no-auto-calibrate]
+//!             [--stations libsurvive-config.json] [--no-auto-calibrate] [--clock]
+//!
+//! --save-stations FILE: each calibration's stations, in the --stations format (to replay
+//! another run on the same stations with --no-auto-calibrate).
+//!
+//! --clock MS: as a host that maps its clock onto the device's would, tick Input::Clock
+//! every 1 ms of device time (the P4's tick) up to the newest input's time less MS (how far light can
+//! trail the IMU on the link: ~4 ms over the Watchman radio), decoded recordings only, so
+//! sweeps go out as soon as the laser has passed (the P4 does this). --stream: with
+//! --clock, send each sweep's hits as they come (TimingConfig::stream_sweeps).
 //!
 //! With --raw, everything comes from the raw HID bytes in the recording
 //! (HIDIN reports, HIDFEAT config readout) through lh_protocol: the whole
@@ -146,6 +155,9 @@ fn main() {
     if args.iter().any(|a| a == "--no-auto-calibrate") {
         cfg.auto_calibrate = false;
     }
+    if args.iter().any(|a| a == "--stream") {
+        cfg.timing.stream_sweeps = true;
+    }
     if args.iter().any(|a| a == "--no-station-cov") {
         cfg.station_cov_in_filter = false;
     }
@@ -177,7 +189,10 @@ fn main() {
             kernel.push(i, &mut ev);
         }
     }
+    *SAVE_STATIONS.lock().unwrap() = opt("--save-stations");
     let raw = args.iter().any(|a| a == "--raw");
+    let clock_lag: Option<u32> = opt("--clock").map(|v| (v.parse::<f64>().expect("--clock MS") * 48_000.0) as u32);
+    let mut clock: HashMap<u32, u32> = HashMap::new();
     let reader = BufReader::new(GzDecoder::new(File::open(rec).unwrap()));
     // --raw state per device name.
     let mut cfg_readers: HashMap<String, ConfigReader> = HashMap::new();
@@ -303,9 +318,34 @@ fn main() {
             _ => None,
         };
         let Some(input) = input else { continue };
+        if let Some(lag) = clock_lag {
+            let at = match &input {
+                Input::Pulse { dev, pulse } => Some((*dev, pulse.start.wrapping_add(pulse.len).wrapping_sub(lag))),
+                Input::Imu { dev, time, .. } => Some((*dev, time.wrapping_sub(lag))),
+                _ => None,
+            };
+            if let Some((dev, t)) = at {
+                let last = clock.entry(dev).or_insert(t);
+                while (t.wrapping_sub(*last) as i32) > 48_000 {
+                    *last = last.wrapping_add(48_000);
+                    kernel.push(Input::Clock { dev, time: *last }, &mut ev);
+                    for e in ev.drain(..) {
+                        emit(&e, &devs, t0.unwrap_or(0), out_file(&mut out_w), events.as_mut());
+                    }
+                }
+            }
+        }
         kernel.push(input, &mut ev);
         for e in ev.drain(..) {
             emit(&e, &devs, t0.unwrap_or(0), out_file(&mut out_w), events.as_mut());
+        }
+    }
+    for (name, &id) in &devs {
+        if let Some(ts) = kernel.timing_stats(id) {
+            eprintln!("timing {}: {} sweeps, {} early, {} late sweep pulses", name, ts.sweeps, ts.early_sweeps, ts.late_sweep_pulses);
+            if args.iter().any(|a| a == "--timing-stats") {
+                eprintln!("timing {}: {:?}", name, ts);
+            }
         }
     }
     // Innovation statistics per (station, axis) since the last report.
@@ -328,7 +368,22 @@ fn unhex(s: &str) -> Vec<u8> {
     (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap_or(0)).collect()
 }
 
+/// --save-stations FILE.
+static SAVE_STATIONS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn emit(e: &Event, devs: &HashMap<String, u32>, t0: i64, out: &mut impl Write, events: Option<&mut BufWriter<File>>) {
+    if let (Event::Calibrated { stations, .. }, Some(path)) = (e, SAVE_STATIONS.lock().unwrap().as_ref()) {
+        let st: Vec<Value> = stations
+            .iter()
+            .map(|s| {
+                let p = &s.world_from_station;
+                let ax = |c: &AxisCal| serde_json::json!([c.phase, c.tilt, c.curve, c.gibphase, c.gibmag]);
+                serde_json::json!({"id": s.id, "pose": [p.pos.x, p.pos.y, p.pos.z, p.rot.w, p.rot.x, p.rot.y, p.rot.z],
+                    "cov": s.cov.d, "cal": [ax(&s.cal[0]), ax(&s.cal[1])]})
+            })
+            .collect();
+        std::fs::write(path, serde_json::json!({ "stations": st }).to_string()).unwrap();
+    }
     let name = |d: u32| devs.iter().find(|(_, v)| **v == d).map(|(k, _)| k.clone()).unwrap_or_default();
     if let Event::Pose { dev, time, used, gated, world_from_body: b, .. } = e {
         writeln!(out, "{:.6} {} USEDGATED {} {}", (*time - t0) as f64 / 48e6, name(*dev), used, gated).unwrap();
@@ -341,7 +396,20 @@ fn emit(e: &Event, devs: &HashMap<String, u32>, t0: i64, out: &mut impl Write, e
         )
         .unwrap();
     }
-    if let Event::Pose { dev, time, world_from_head: p, .. } = e {
+    if let Event::Pose { dev, time, light, world_from_head: p, velocity: v, .. } = e {
+        // The head position at the pose's newest light hit (back along the velocity), to
+        // compare runs whose poses were propagated to different IMU times.
+        let back = (*time - *light) as f64 / 48e6;
+        writeln!(
+            out,
+            "{:.6} {} LIGHTPOSE {:.6} {:.6} {:.6}",
+            (*light - t0) as f64 / 48e6,
+            name(*dev),
+            p.pos.x - v.x * back,
+            p.pos.y - v.y * back,
+            p.pos.z - v.z * back
+        )
+        .unwrap();
         writeln!(
             out,
             "{:.6} {} POSE {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",

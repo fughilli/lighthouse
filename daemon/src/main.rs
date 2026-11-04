@@ -1,6 +1,13 @@
 //! lhd: the lighthouse tracking daemon.
 //!
 //!   lhd [--replay REC.gz [--speed 1.0]] [--calibration FILE.json] [--record FILE.rec.gz]
+//!       [--host-clock [--stream-sweeps]] [--pose-timing]
+//!
+//! --host-clock maps each device's clock onto the report timestamps and tells the kernel
+//! which device time has passed (Input::Clock, every ms), so a sweep goes out once the laser
+//! has passed instead of at the next cycle's sync. With it or --pose-timing alone, each pose
+//! also gets a "pose_timing" line: its light and pose times on the host clock, and when it
+//! came out. --stream-sweeps sends each sweep's hits as they come (TimingConfig::stream_sweeps).
 //!
 //! Transport (live hidapi, or a recording) → lh_protocol (device handshake,
 //! report decoding) → lh_kernel → JSON lines on stdout. Commands come in as
@@ -43,7 +50,10 @@ fn main() {
     };
     let replay = opt("--replay").is_some();
 
-    let mut kernel = Kernel::new(KernelConfig::default());
+    let stream = args.iter().any(|a| a == "--stream-sweeps");
+    let mut cfg = KernelConfig::default();
+    cfg.timing.stream_sweeps = stream;
+    let mut kernel = Kernel::new(cfg);
     let mut events: Vec<Event> = Vec::new();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -85,6 +95,9 @@ fn main() {
     });
 
     let mut mgr = DeviceManager::new();
+    mgr.host_clock = args.iter().any(|a| a == "--host-clock");
+    mgr.pose_timing = args.iter().any(|a| a == "--pose-timing");
+    mgr.stream = stream;
     let mut notes: Vec<Note> = Vec::new();
     let start = Instant::now();
     loop {
@@ -131,6 +144,12 @@ fn main() {
         }
         out.flush().ok();
         if replay && idle && transport.finished() {
+            if mgr.pose_timing || mgr.host_clock {
+                mgr.timing_summary(&mut notes);
+                for n in notes.drain(..) {
+                    emit(&mut out, n.to_json());
+                }
+            }
             break;
         }
     }

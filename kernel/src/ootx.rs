@@ -6,6 +6,7 @@
 //! in bytes (little-endian: its two bytes as they arrive); the payload follows,
 //! padded to an even length, then a CRC-32 (zlib polynomial) of the payload.
 
+use crate::Real;
 use crate::lh1::AxisCal;
 use alloc::vec::Vec;
 
@@ -133,15 +134,15 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// IEEE half precision to f64.
-pub fn f16_to_f64(h: u16) -> f64 {
+/// IEEE half precision to Real.
+pub fn f16_to_f64(h: u16) -> Real {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((h >> 10) & 0x1f) as i32;
-    let frac = (h & 0x3ff) as f64;
+    let frac = (h & 0x3ff) as Real;
     match exp {
-        0 => sign * frac * libm::pow(2.0, -24.0),
-        31 => sign * f64::INFINITY,
-        e => sign * (1.0 + frac / 1024.0) * libm::pow(2.0, (e - 15) as f64),
+        0 => sign * frac * crate::math::pow(2.0, -24.0),
+        31 => sign * Real::INFINITY,
+        e => sign * (1.0 + frac / 1024.0) * crate::math::pow(2.0, (e - 15) as Real),
     }
 }
 

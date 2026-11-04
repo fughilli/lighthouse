@@ -5,8 +5,10 @@
 //! disconnecting.
 
 use crate::record::Recorder;
+use lh_device::clock::HostClock;
 use lh_device::{Decoder, Link, LinkError, Output};
 use lh_kernel::kernel::{Event, Input, Kernel};
+use lh_kernel::Real;
 use lh_protocol::commands;
 use lh_protocol::devices::{self, DeviceKind, DeviceType, Interface};
 use lh_transport::{DeviceInfo, Transport, TransportError, TransportEvent};
@@ -38,12 +40,27 @@ struct Dev {
     /// Last button mask reported (the tracker repeats states).
     buttons: Option<u32>,
     last_error: Option<String>,
+    /// --host-clock: the device's clock on the report timestamps, and the last host time
+    /// told to the kernel (Input::Clock).
+    clock: HostClock,
+    clock_us: i64,
+    /// --pose-timing: report lateness over the fastest, 0.5 ms bins, [IMU-only, with light].
+    late_hist: [[u32; 16]; 2],
 }
 
 pub struct DeviceManager {
     devs: Vec<Dev>,
     next_kernel_id: u32,
     now: Duration,
+    /// --host-clock: map each device's clock onto the report timestamps and tick the kernel
+    /// with it (1 ms of host time apart, like the P4), so a sweep goes out once the laser
+    /// has passed; each pose then also gets a "pose_timing" note on the host clock.
+    pub host_clock: bool,
+    /// --pose-timing: the "pose_timing" notes alone (no clock ticks), to compare.
+    pub pose_timing: bool,
+    /// --stream-sweeps (with --host-clock): the kernel streams sweeps, so the clock it gets
+    /// is the mapped time itself, not less the light margin.
+    pub stream: bool,
 }
 
 /// A device's control link through the transport, recording every feature
@@ -90,7 +107,7 @@ fn set(t: &mut dyn Transport, dev: &Dev, data: &[u8], rec: &mut Recorder) -> boo
 
 impl DeviceManager {
     pub fn new() -> DeviceManager {
-        DeviceManager { devs: Vec::new(), next_kernel_id: 0, now: Duration::ZERO }
+        DeviceManager { devs: Vec::new(), next_kernel_id: 0, now: Duration::ZERO, host_clock: false, pose_timing: false, stream: false }
     }
 
     /// Set the clock before handling a batch. A handshake blocks the loop for a
@@ -126,6 +143,9 @@ impl DeviceManager {
                     last_imu_note: 0.0,
                     buttons: None,
                     last_error: None,
+                    clock: HostClock::new(),
+                    clock_us: 0,
+                    late_hist: [[0; 16]; 2],
                 });
                 // Handshake right away (a recording's responses come first).
                 self.tick(t, kernel, events, rec, notes, self.now);
@@ -149,8 +169,30 @@ impl DeviceManager {
                     return;
                 }
                 let Some(dec) = d.dec.as_mut() else { return };
+                let host_clock = self.host_clock;
+                let stream = self.stream;
+                let passed = |c: &HostClock, us: i64| if stream { c.now(us) } else { c.passed(us) };
+                let timing = host_clock || self.pose_timing;
+                let host_us = host_us as i64;
+                if host_clock && d.clock.mapped() {
+                    // The P4 ticks every millisecond between reports.
+                    while d.clock_us != 0 && host_us - d.clock_us > 1_000 {
+                        d.clock_us += 1_000;
+                        let start = events.len();
+                        if let Some(raw) = passed(&d.clock, d.clock_us) {
+                            kernel.push(Input::Clock { dev: dec.dev, time: raw }, events);
+                        }
+                        pose_timing(&d.clock, &events[start..], d.clock_us, &dec.config.serial, notes);
+                    }
+                }
                 let mut outs = Vec::new();
                 dec.report(interface, &data, &mut outs);
+                let start = events.len();
+                if timing {
+                    if let Some((late, light)) = d.clock.observe(&outs, host_us) {
+                        d.late_hist[light as usize][((late.max(0) / 500) as usize).min(15)] += 1;
+                    }
+                }
                 let serial = dec.config.serial.clone();
                 let head_rot = dec.config.model.body_from_head.rot.conj();
                 for o in outs {
@@ -181,6 +223,15 @@ impl DeviceManager {
                         Output::TurnedOff => d.last_report = Duration::ZERO,
                     }
                 }
+                if host_clock {
+                    if let Some(raw) = passed(&d.clock, host_us) {
+                        kernel.push(Input::Clock { dev: dec.dev, time: raw }, events);
+                    }
+                    d.clock_us = host_us;
+                }
+                if timing {
+                    pose_timing(&d.clock, &events[start..], host_us, &serial, notes);
+                }
             }
         }
     }
@@ -209,8 +260,8 @@ impl DeviceManager {
                         let d = &mut self.devs[i];
                         // Sensors in the head frame (the frame poses are reported in), for viewers.
                         let head_from_body = config.model.body_from_head.inverse();
-                        let sensors_head: Vec<[f64; 3]> = config.model.sensors.iter().map(|p| head_from_body.apply(*p).to_array()).collect();
-                        let normals_head: Vec<[f64; 3]> =
+                        let sensors_head: Vec<[Real; 3]> = config.model.sensors.iter().map(|p| head_from_body.apply(*p).to_array()).collect();
+                        let normals_head: Vec<[Real; 3]> =
                             config.model.normals.iter().map(|n| head_from_body.rot.rotate(*n).to_array()).collect();
                         notes.push(Note(json!({"type":"device","name":d.info.name,"serial":config.serial,
                             "model":config.model_number,"sensors":config.model.sensors.len(),"state":"connected",
@@ -246,6 +297,15 @@ impl DeviceManager {
         }
     }
 
+    /// --pose-timing: each device's report lateness histogram, as notes.
+    pub fn timing_summary(&self, notes: &mut Vec<Note>) {
+        for d in &self.devs {
+            let serial = d.dec.as_ref().map(|x| x.config.serial.clone()).unwrap_or_default();
+            notes.push(Note(json!({"type":"report_lateness","serial":serial,"bin_us":500,
+                "imu":d.late_hist[0],"light":d.late_hist[1]})));
+        }
+    }
+
     pub fn pair_all(&mut self, t: &mut dyn Transport, rec: &mut Recorder, notes: &mut Vec<Note>) {
         for d in &self.devs {
             if d.kind.kind == DeviceKind::Dongle {
@@ -266,6 +326,18 @@ impl DeviceManager {
 }
 
 /// libsurvive's interface names, so recordings stay compatible.
+/// --host-clock: each new pose's light time on the host clock and the host time it came
+/// out at (a report's arrival or a clock tick), for latency analysis.
+fn pose_timing(clock: &HostClock, new: &[Event], at_us: i64, serial: &str, notes: &mut Vec<Note>) {
+    for e in new {
+        if let Event::Pose { time, light, .. } = e {
+            notes.push(Note(json!({"type":"pose_timing","serial":serial,"t":*time as f64 / 48e6,
+                "light_us":clock.to_host_us(*light as u32),"pose_us":clock.to_host_us(*time as u32),
+                "at_us":at_us,"margin_us":clock.margin_us()})));
+        }
+    }
+}
+
 fn iface_name(role: Option<Interface>) -> &'static str {
     match role {
         Some(Interface::Watchman) => "IMU/Lightcap/Buttons",

@@ -1,6 +1,7 @@
 //! Small dense row-major matrices for the filters and solvers (sizes ~3..40),
 //! plus the SO(3) pieces the error-state models need.
 
+use crate::Real;
 use crate::math::{sqrt, Quat, Vec3};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -9,7 +10,7 @@ use alloc::vec::Vec;
 pub struct Mat {
     pub rows: usize,
     pub cols: usize,
-    pub d: Vec<f64>,
+    pub d: Vec<Real>,
 }
 
 impl Mat {
@@ -25,7 +26,7 @@ impl Mat {
         m
     }
 
-    pub fn diag(v: &[f64]) -> Mat {
+    pub fn diag(v: &[Real]) -> Mat {
         let mut m = Mat::zeros(v.len(), v.len());
         for (i, x) in v.iter().enumerate() {
             m[(i, i)] = *x;
@@ -76,7 +77,7 @@ impl Mat {
         m
     }
 
-    pub fn scale(&self, s: f64) -> Mat {
+    pub fn scale(&self, s: Real) -> Mat {
         let mut m = self.clone();
         m.d.iter_mut().for_each(|x| *x *= s);
         m
@@ -164,26 +165,26 @@ impl Mat {
         self.solve_spd(&Mat::identity(self.rows))
     }
 
-    pub fn col(v: &[f64]) -> Mat {
+    pub fn col(v: &[Real]) -> Mat {
         Mat { rows: v.len(), cols: 1, d: v.to_vec() }
     }
 }
 
 impl core::ops::Index<(usize, usize)> for Mat {
-    type Output = f64;
-    fn index(&self, (r, c): (usize, usize)) -> &f64 {
+    type Output = Real;
+    fn index(&self, (r, c): (usize, usize)) -> &Real {
         &self.d[r * self.cols + c]
     }
 }
 
 impl core::ops::IndexMut<(usize, usize)> for Mat {
-    fn index_mut(&mut self, (r, c): (usize, usize)) -> &mut f64 {
+    fn index_mut(&mut self, (r, c): (usize, usize)) -> &mut Real {
         &mut self.d[r * self.cols + c]
     }
 }
 
 /// Rotation matrix of a unit quaternion (rows).
-pub fn rot_mat(q: Quat) -> [[f64; 3]; 3] {
+pub fn rot_mat(q: Quat) -> [[Real; 3]; 3] {
     let (w, x, y, z) = (q.w, q.x, q.y, q.z);
     [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
@@ -193,11 +194,11 @@ pub fn rot_mat(q: Quat) -> [[f64; 3]; 3] {
 }
 
 /// [v]ₓ such that [v]ₓ u = v × u.
-pub fn skew(v: Vec3) -> [[f64; 3]; 3] {
+pub fn skew(v: Vec3) -> [[Real; 3]; 3] {
     [[0.0, -v.z, v.y], [v.z, 0.0, -v.x], [-v.y, v.x, 0.0]]
 }
 
-pub fn mat3_vec(m: &[[f64; 3]; 3], v: Vec3) -> Vec3 {
+pub fn mat3_vec(m: &[[Real; 3]; 3], v: Vec3) -> Vec3 {
     Vec3::new(
         m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
         m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
@@ -206,7 +207,7 @@ pub fn mat3_vec(m: &[[f64; 3]; 3], v: Vec3) -> Vec3 {
 }
 
 /// vᵀ M (row vector times matrix).
-pub fn vec_mat3(v: Vec3, m: &[[f64; 3]; 3]) -> Vec3 {
+pub fn vec_mat3(v: Vec3, m: &[[Real; 3]; 3]) -> Vec3 {
     Vec3::new(
         v.x * m[0][0] + v.y * m[1][0] + v.z * m[2][0],
         v.x * m[0][1] + v.y * m[1][1] + v.z * m[2][1],

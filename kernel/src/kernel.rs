@@ -19,6 +19,7 @@
 //! the origin at the tracker's IMU in its first still scene and the x axis
 //! along that tracker's body x (levelled). A loaded calibration keeps its frame.
 
+use crate::Real;
 use crate::lh1::AxisCal;
 use crate::linalg::{rot_mat, skew, Mat};
 use crate::math::{Pose, Quat, Vec3};
@@ -50,6 +51,11 @@ pub enum Input {
     StationPrior { id: u32, world_from_station: Pose, cov: Mat, cal: Option<[AxisCal; 2]> },
     /// Solve the station calibration again from the scenes collected.
     Recalibrate,
+    /// The host's word that the device's clock has passed `time` (ticks, wrapping) and
+    /// every pulse before it was pushed: a host that maps its clock to the device's sends
+    /// this between reports, and a sweep then goes out as soon as the laser has passed
+    /// (TimingConfig::sweep_quiet_ticks) instead of at the next cycle's sync.
+    Clock { dev: DeviceId, time: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -59,9 +65,9 @@ pub struct StationReport {
     pub world_from_station: Pose,
     pub cov: Mat,
     /// RMS angle residual of its hits in the fit (rad).
-    pub rms: f64,
+    pub rms: Real,
     /// Angle between its OOTX gravity vector and world z (rad).
-    pub up_error: f64,
+    pub up_error: Real,
     pub cal: [AxisCal; 2],
 }
 
@@ -75,16 +81,17 @@ pub enum Event {
     StationSeen { dev: DeviceId, slot: u8, info: StationInfo },
     Still { dev: DeviceId, still: bool },
     /// New station calibration; `reason` says why it ran.
-    Calibrated { reason: CalibrationReason, stations: Vec<StationReport>, scenes: usize, dropped: usize, tracker_up_error: f64 },
+    Calibrated { reason: CalibrationReason, stations: Vec<StationReport>, scenes: usize, dropped: usize, tracker_up_error: Real },
     /// A still scene where the calibrated stations put the tracker in
     /// different places (largest difference, m and rad); `count` in a row.
-    StationsDisagree { dev: DeviceId, pos: f64, rot: f64, count: u32 },
-    TrackingStarted { dev: DeviceId, rms: f64 },
+    StationsDisagree { dev: DeviceId, pos: Real, rot: Real, count: u32 },
+    TrackingStarted { dev: DeviceId, rms: Real },
     TrackingLost { dev: DeviceId, reason: TrackLoss },
     /// The device's pose ("head" frame) in the world. `cov` is 6x6 over
     /// (position, rotation), both in world axes; `time` device ticks
-    /// (unwrapped).
-    Pose { dev: DeviceId, time: i64, world_from_head: Pose, world_from_body: Pose, velocity: Vec3, cov: Mat, used: u32, gated: u32 },
+    /// (unwrapped); `light` the device time of the newest hit in it (the pose is
+    /// propagated past it to the newest IMU sample, `time`).
+    Pose { dev: DeviceId, time: i64, light: i64, world_from_head: Pose, world_from_body: Pose, velocity: Vec3, cov: Mat, used: u32, gated: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,18 +120,18 @@ pub struct KernelConfig {
     pub track: TrackConfig,
     /// Still: mean gyro norm below (rad/s) and accel norm spread below (g),
     /// over `still_window` seconds.
-    pub still_gyro: f64,
-    pub still_accel: f64,
-    pub still_window: f64,
+    pub still_gyro: Real,
+    pub still_accel: Real,
+    pub still_window: Real,
     /// A still stretch becomes a scene after this long (s); one scene is cut
     /// at most this long.
-    pub scene_min: f64,
-    pub scene_max: f64,
+    pub scene_min: Real,
+    pub scene_max: Real,
     pub max_scenes: usize,
     /// Calibration: per station, sensors needed in a scene to use it there.
     pub scene_min_sensors: usize,
     /// Calibration: residual beyond which an observation is dropped (rad).
-    pub calib_reject: f64,
+    pub calib_reject: Real,
     pub auto_calibrate: bool,
     /// Fold each station's calibration covariance into its hits' noise. Off:
     /// the covariance is dominated by the shared world tilt (a gauge freedom),
@@ -134,20 +141,27 @@ pub struct KernelConfig {
     /// While still: zero-velocity and gravity-direction updates, their σ
     /// (m/s, rad).
     pub still_updates: bool,
-    pub still_sigma_vel: f64,
-    pub still_sigma_up: f64,
+    pub still_sigma_vel: Real,
+    pub still_sigma_up: Real,
     /// Tracking is dropped after this many gated hits in a row.
     pub lost_after_gated: u32,
     /// ... or this long without a used hit (s).
-    pub lost_after_dark: f64,
+    pub lost_after_dark: Real,
     /// The stations count as moved when single-station poses of a still
     /// tracker differ by more than these (m, rad) in `moved_after` scenes in
     /// a row. A good calibration agrees to ~1 cm.
-    pub moved_pos: f64,
-    pub moved_rot: f64,
+    pub moved_pos: Real,
+    pub moved_rot: Real,
     pub moved_after: u32,
+    /// Check still scenes against the calibrated stations at all (a pose solve per
+    /// scene). Off where another host owns the stations (the P4 adopting lhd's).
+    pub check_stations: bool,
+    /// While not tracking, try to start (a pose bootstrap) at most this often (s, IMU
+    /// time); 0: on every sweep. A slow host (the P4) can't bootstrap a few hundred
+    /// times a second and falls behind its input.
+    pub start_interval: Real,
     /// Added to IMU sample times (s): IMU vs light latency.
-    pub imu_time_offset: f64,
+    pub imu_time_offset: Real,
 }
 
 impl Default for KernelConfig {
@@ -172,14 +186,16 @@ impl Default for KernelConfig {
             lost_after_gated: 60,
             lost_after_dark: 0.5,
             moved_pos: 0.05,
-            moved_rot: 3f64.to_radians(),
+            moved_rot: (3.0 as Real).to_radians(),
             moved_after: 3,
+            check_stations: true,
+            start_interval: 0.0,
             imu_time_offset: 0.0,
         }
     }
 }
 
-const TPS: f64 = crate::lh1::TICKS_PER_SECOND;
+const TPS: Real = crate::lh1::TICKS_PER_SECOND;
 
 /// Device ticks (u32, wrapping) to a monotonic timeline.
 #[derive(Clone, Copy, Debug, Default)]
@@ -214,18 +230,18 @@ struct StationEntry {
 
 #[derive(Default)]
 struct StillDetector {
-    gyro: VecDeque<(i64, f64)>,
-    acc: VecDeque<(i64, f64)>,
+    gyro: VecDeque<(i64, Real)>,
+    acc: VecDeque<(i64, Real)>,
     still: bool,
     since: i64,
 }
 
 struct Cluster {
-    values: Vec<f64>,
+    values: Vec<Real>,
 }
 
 impl Cluster {
-    fn median(&self) -> f64 {
+    fn median(&self) -> Real {
         let mut v = self.values.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
@@ -254,7 +270,7 @@ impl SceneBuilder {
             };
             let cl = &mut self.clusters[idx].1;
             for c in &h.candidates {
-                match cl.iter_mut().find(|k| libm::fabs(k.values[k.values.len() - 1] - c.angle) < 2e-3) {
+                match cl.iter_mut().find(|k| crate::math::fabs(k.values[k.values.len() - 1] - c.angle) < 2e-3) {
                     Some(k) => {
                         if k.values.len() < 1024 {
                             k.values.push(c.angle)
@@ -277,7 +293,7 @@ struct SceneRecord {
     dev: DeviceId,
     up_body: Vec3,
     /// (station id, axis, sensor, angle, count), several per key possible.
-    obs: Vec<(u32, u8, u8, f64, usize)>,
+    obs: Vec<(u32, u8, u8, Real, usize)>,
     pose: Option<Pose>,
 }
 
@@ -294,10 +310,12 @@ struct Device {
     track: Option<TrackState>,
     recent: VecDeque<(u32, u8, Vec<SensorHits>)>,
     gated_run: u32,
+    /// IMU time of the last start attempt (cfg.start_interval).
+    last_start: Option<i64>,
     last_used: i64,
     window: UpdateStats,
     /// Diagnostics: innovation sum, sum of squares and count per (station, axis).
-    innovations: Vec<((u32, u8), f64, f64, u32)>,
+    innovations: Vec<((u32, u8), Real, Real, u32)>,
     /// Station id → index of its angle-bias states in the tracker filter.
     bias_slots: Vec<u32>,
 }
@@ -351,6 +369,7 @@ impl Kernel {
                     track: None,
                     recent: VecDeque::new(),
                     gated_run: 0,
+                    last_start: None,
                     last_used: 0,
                     window: UpdateStats::default(),
                     innovations: Vec::new(),
@@ -371,6 +390,14 @@ impl Kernel {
                     self.timing_event(di, e, out);
                 }
             }
+            Input::Clock { dev, time } => {
+                let Some(di) = self.devices.iter().position(|d| d.id == dev) else { return };
+                let mut tev = Vec::new();
+                self.devices[di].timing.clock(time, &mut tev);
+                for e in tev {
+                    self.timing_event(di, e, out);
+                }
+            }
             Input::StationPrior { id, world_from_station, cov, cal } => {
                 let si = self.station_index(id);
                 let st = &mut self.stations[si];
@@ -382,7 +409,7 @@ impl Kernel {
                 // Prior strength from the saved covariance, floored: a saved
                 // calibration is trusted to ~mm / ~mrad at best, and its gauge
                 // directions (zero variance) aren't certainty.
-                let sd = |i: usize| libm::sqrt(cov[(i, i)].max(0.0));
+                let sd = |i: usize| crate::math::sqrt(cov[(i, i)].max(0.0));
                 let sp = sd(0).max(sd(1)).max(sd(2)).max(2e-3);
                 let sr = sd(3).max(sd(4)).max(sd(5)).max(2e-3);
                 st.prior = Some(StationPrior { pose: world_from_station, sigma_pos: sp, sigma_rot: sr });
@@ -396,14 +423,27 @@ impl Kernel {
         }
     }
 
+    /// Switch TimingConfig::stream_sweeps, for every device now and later.
+    pub fn set_stream_sweeps(&mut self, on: bool) {
+        self.cfg.timing.stream_sweeps = on;
+        for d in &mut self.devices {
+            d.timing.set_stream_sweeps(on);
+        }
+    }
+
+    /// Diagnostics: a device's light timing counters.
+    pub fn timing_stats(&self, dev: DeviceId) -> Option<crate::timing::TimingStats> {
+        self.devices.iter().find(|d| d.id == dev).map(|d| d.timing.stats)
+    }
+
     /// Diagnostics: per (station id, axis) of a device, the mean and RMS
     /// innovation (rad) of the hits used, and their count; then resets.
-    pub fn take_innovations(&mut self, dev: DeviceId) -> Vec<(u32, u8, f64, f64, u32)> {
+    pub fn take_innovations(&mut self, dev: DeviceId) -> Vec<(u32, u8, Real, Real, u32)> {
         let Some(d) = self.devices.iter_mut().find(|d| d.id == dev) else { return Vec::new() };
         let v = d
             .innovations
             .iter()
-            .map(|e| (e.0 .0, e.0 .1, e.1 / e.3 as f64, libm::sqrt(e.2 / e.3 as f64), e.3))
+            .map(|e| (e.0 .0, e.0 .1, e.1 / e.3 as Real, crate::math::sqrt(e.2 / e.3 as Real), e.3))
             .collect();
         d.innovations.clear();
         v
@@ -441,10 +481,10 @@ impl Kernel {
         while d.still.acc.front().map_or(false, |x| x.0 < t - w) {
             d.still.acc.pop_front();
         }
-        let n = d.still.gyro.len().max(1) as f64;
-        let g = d.still.gyro.iter().map(|x| x.1).sum::<f64>() / n;
-        let am = d.still.acc.iter().map(|x| x.1).sum::<f64>() / n;
-        let asd = libm::sqrt(d.still.acc.iter().map(|x| (x.1 - am) * (x.1 - am)).sum::<f64>() / n);
+        let n = d.still.gyro.len().max(1) as Real;
+        let g = d.still.gyro.iter().map(|x| x.1).sum::<Real>() / n;
+        let am = d.still.acc.iter().map(|x| x.1).sum::<Real>() / n;
+        let asd = crate::math::sqrt(d.still.acc.iter().map(|x| (x.1 - am) * (x.1 - am)).sum::<Real>() / n);
         let full = d.still.gyro.front().map_or(false, |x| x.0 <= t - w * 9 / 10);
         let still = full && g < cfg.still_gyro && asd < cfg.still_accel;
         if still != d.still.still {
@@ -471,11 +511,11 @@ impl Kernel {
                 sb.acc_sum = sb.acc_sum.add(accel_g);
                 sb.acc_n += 1;
             }
-            let dur = (t - d.still.since) as f64 / TPS;
+            let dur = (t - d.still.since) as Real / TPS;
             if d.scene.is_none() && dur >= 0.3 {
                 d.scene = Some(SceneBuilder { start: t, clusters: Vec::new(), acc_sum: Vec3::ZERO, acc_n: 0 });
             }
-            if d.scene.as_ref().map_or(false, |s| (t - s.start) as f64 / TPS >= cfg.scene_max) {
+            if d.scene.as_ref().map_or(false, |s| (t - s.start) as Real / TPS >= cfg.scene_max) {
                 self.finish_scene(di, out);
                 // Keep collecting the next scene only if this stays still a while.
                 let d = &mut self.devices[di];
@@ -487,7 +527,7 @@ impl Kernel {
     fn finish_scene(&mut self, di: usize, out: &mut Vec<Event>) {
         let d = &mut self.devices[di];
         let Some(sb) = d.scene.take() else { return };
-        let dur = d.last_imu.map_or(0, |x| x.0 - sb.start) as f64 / TPS;
+        let dur = d.last_imu.map_or(0, |x| x.0 - sb.start) as Real / TPS;
         if dur < self.cfg.scene_min || sb.acc_n == 0 {
             return;
         }
@@ -500,7 +540,7 @@ impl Kernel {
                 obs.push((*st, *axis, *sensor, c.median(), c.values.len()));
             }
         }
-        let up = sb.acc_sum.scale(1.0 / sb.acc_n as f64);
+        let up = sb.acc_sum.scale(1.0 / sb.acc_n as Real);
         let pose = d.track.as_ref().map(|t| t.pose());
         let mut rec = SceneRecord { dev: d.id, up_body: up.normalized(), obs, pose };
         // Only scenes that see some station well.
@@ -590,7 +630,18 @@ impl Kernel {
         let d = &mut self.devices[di];
 
         if d.track.is_none() {
-            d.recent.push_back((sid, s.axis, s.hits.clone()));
+            // A later part of the sweep just before (streaming) joins it.
+            match d.recent.back_mut() {
+                Some(r) if s.part > 0 && r.0 == sid && r.1 == s.axis => {
+                    for h in &s.hits {
+                        match r.2.iter_mut().find(|x| x.sensor == h.sensor) {
+                            Some(x) => x.candidates.extend_from_slice(&h.candidates),
+                            None => r.2.push(h.clone()),
+                        }
+                    }
+                }
+                _ => d.recent.push_back((sid, s.axis, s.hits.clone())),
+            }
             while d.recent.len() > 8 {
                 d.recent.pop_front();
             }
@@ -660,8 +711,8 @@ impl Kernel {
         }
         let track = d.track.as_ref().unwrap();
         let now = hits.last().map_or(track.time, |h| h.0);
-        let dark = (now - d.last_used) as f64 / TPS;
-        let trace: f64 = (0..3).map(|i| track.cov[(i, i)]).sum();
+        let dark = (now - d.last_used) as Real / TPS;
+        let trace: Real = (0..3).map(|i| track.cov[(i, i)]).sum();
         let loss = if d.gated_run >= cfg.lost_after_gated {
             Some(TrackLoss::Gated)
         } else if dark > cfg.lost_after_dark {
@@ -688,6 +739,7 @@ impl Kernel {
         out.push(Event::Pose {
             dev: d.id,
             time: pubst.time,
+            light: now,
             world_from_head: pose,
             world_from_body: pubst.pose(),
             velocity: pubst.vel,
@@ -728,7 +780,7 @@ impl Kernel {
         for (sid, axis, hits) in &d.recent {
             let si = ids.iter().position(|x| x == sid).unwrap();
             for h in hits {
-                let angles: Vec<f64> = h.candidates.iter().map(|c| c.angle).collect();
+                let angles: Vec<Real> = h.candidates.iter().map(|c| c.angle).collect();
                 match cands.iter_mut().find(|c| c.station == si && c.axis == *axis && c.sensor == h.sensor as u16) {
                     Some(c) => {
                         // Same key in a later sweep: keep the newest.
@@ -740,6 +792,13 @@ impl Kernel {
         }
         if cands.len() < 10 {
             return;
+        }
+        if cfg.start_interval > 0.0 {
+            let now = d.last_imu.map_or(0, |x| x.0);
+            if d.last_start.is_some_and(|t| now >= t && ((now - t) as Real) < cfg.start_interval * TPS) {
+                return;
+            }
+            d.last_start = Some(now);
         }
         let up = d.last_imu.map(|x| x.1);
         let Some(sol) = bootstrap_pose_assoc(&d.model, &models, &cands, up, 3e-3, &cfg.solve) else { return };
@@ -760,6 +819,9 @@ impl Kernel {
     /// `moved_after` disagreeing scenes in a row, drops the calibration.
     fn check_stations(&mut self, rec: &SceneRecord, out: &mut Vec<Event>) {
         let cfg = self.cfg;
+        if !cfg.check_stations {
+            return;
+        }
         let (ids, known): (Vec<u32>, Vec<StationModel>) = self
             .stations
             .iter()
@@ -842,7 +904,7 @@ impl Kernel {
         let cal_of = |k: &Kernel, id: u32| k.stations.iter().find(|s| s.id == id).unwrap().cal.unwrap();
         let up_of = |k: &Kernel, id: u32| -> Option<Vec3> {
             k.stations.iter().find(|s| s.id == id).unwrap().info.as_ref().map(|i| {
-                Vec3::new(i.accel_dir[0] as f64, i.accel_dir[1] as f64, i.accel_dir[2] as f64).normalized()
+                Vec3::new(i.accel_dir[0] as Real, i.accel_dir[1] as Real, i.accel_dir[2] as Real).normalized()
             })
         };
 
@@ -855,7 +917,7 @@ impl Kernel {
             let level = quat_between(sc.up_body, Vec3::new(0.0, 0.0, 1.0));
             // Keep the body x heading: remove yaw introduced by levelling.
             let x = level.rotate(Vec3::new(1.0, 0.0, 0.0));
-            let yaw = libm::atan2(x.y, x.x);
+            let yaw = crate::math::atan2(x.y, x.x);
             let rot = Quat::from_rotvec(Vec3::new(0.0, 0.0, -yaw)).mul(level).normalized();
             scene_poses[first] = Some(Pose { pos: Vec3::ZERO, rot });
             self.world_fixed = true;
@@ -971,10 +1033,10 @@ fn same_place(a: &SceneRecord, b: &SceneRecord) -> bool {
     if a.dev != b.dev {
         return false;
     }
-    let mut d: Vec<f64> = Vec::new();
+    let mut d: Vec<Real> = Vec::new();
     for o in &b.obs {
         if let Some(p) = a.obs.iter().find(|p| p.0 == o.0 && p.1 == o.1 && p.2 == o.2) {
-            d.push(libm::fabs(p.3 - o.3));
+            d.push(crate::math::fabs(p.3 - o.3));
         }
     }
     if d.len() < 6 {
@@ -995,8 +1057,8 @@ fn sensors_seen(sc: &SceneRecord, station: u32) -> usize {
 }
 
 /// The most-hit candidate per (axis, sensor) of one station in a scene.
-fn first_obs(sc: &SceneRecord, station: u32) -> Vec<(u8, u8, f64)> {
-    let mut v: Vec<(u8, u8, f64)> = Vec::new();
+fn first_obs(sc: &SceneRecord, station: u32) -> Vec<(u8, u8, Real)> {
+    let mut v: Vec<(u8, u8, Real)> = Vec::new();
     for o in &sc.obs {
         if o.0 == station && !v.iter().any(|x| x.0 == o.1 && x.1 == o.2) {
             v.push((o.1, o.2, o.3));

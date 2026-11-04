@@ -9,6 +9,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use lh_kernel::math::{Pose, Vec3};
+use lh_kernel::Real;
 use lh_kernel::model::TrackerModel;
 use serde_json::Value;
 
@@ -81,10 +82,10 @@ pub struct DeviceConfig {
 
 fn vec3(v: &Value) -> Option<Vec3> {
     let a = v.as_array()?;
-    Some(Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?))
+    Some(Vec3::new(a.first()?.as_f64()? as Real, a.get(1)?.as_f64()? as Real, a.get(2)?.as_f64()? as Real))
 }
 
-fn arr3(v: Option<&Value>, default: [f64; 3]) -> [f64; 3] {
+fn arr3(v: Option<&Value>, default: [Real; 3]) -> [Real; 3] {
     v.and_then(vec3).map(|v| v.to_array()).unwrap_or(default)
 }
 
@@ -101,7 +102,7 @@ fn frame(v: Option<&Value>) -> Pose {
 }
 
 /// Sensor-position scale per model (libsurvive: survive_default_devices.c).
-fn sensor_scale(model_number: &str) -> f64 {
+fn sensor_scale(model_number: &str) -> Real {
     match model_number {
         "VIVE Tracker 3.0 MV" => 1.0034,
         "Vive Tracker MV" | "Vive. Tracker MV" => 1.00585,

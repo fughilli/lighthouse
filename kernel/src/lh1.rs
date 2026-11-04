@@ -9,11 +9,12 @@
 //! sweep. The sweep angle is the time from the sweeping station's sync to the
 //! hit: `angle = ticks * pi / 400 000 - pi / 2` (0 straight ahead, ±60° FOV).
 
+use crate::Real;
 use crate::math::{asin, atan2, cos, sin, sqrt, Vec3};
-use core::f64::consts::{FRAC_PI_2, PI};
+use crate::consts::{FRAC_PI_2, PI};
 
 /// Device clock.
-pub const TICKS_PER_SECOND: f64 = 48_000_000.0;
+pub const TICKS_PER_SECOND: Real = 48_000_000.0;
 /// One sync-sync-sweep cycle (half a rotor turn).
 pub const CYCLE_TICKS: u32 = 400_000;
 /// Spacing of the two sync slots in a cycle.
@@ -58,20 +59,20 @@ impl SyncCode {
 /// Per-axis factory calibration broadcast in OOTX ("fcal").
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AxisCal {
-    pub phase: f64,
-    pub tilt: f64,
-    pub curve: f64,
-    pub gibphase: f64,
-    pub gibmag: f64,
+    pub phase: Real,
+    pub tilt: Real,
+    pub curve: Real,
+    pub gibphase: Real,
+    pub gibmag: Real,
 }
 
-pub fn ticks_to_angle(ticks: f64) -> f64 {
-    ticks * (PI / CYCLE_TICKS as f64) - FRAC_PI_2
+pub fn ticks_to_angle(ticks: Real) -> Real {
+    ticks * (PI / CYCLE_TICKS as Real) - FRAC_PI_2
 }
 
 /// One axis of libsurvive's model (survive_reproject_axis), with its gradient
 /// in (axis_value, other, z) where z = -p_lh.z (the station looks down -z).
-fn axis_model(cal: &AxisCal, a: f64, o: f64, z: f64, invert: bool) -> (f64, [f64; 3]) {
+fn axis_model(cal: &AxisCal, a: Real, o: Real, z: Real, invert: bool) -> (Real, [Real; 3]) {
     let s = if invert { -1.0 } else { 1.0 };
     let r2 = a * a + z * z;
     let mag = sqrt(r2);
@@ -96,7 +97,7 @@ fn axis_model(cal: &AxisCal, a: f64, o: f64, z: f64, invert: bool) -> (f64, [f64
 
 /// Predicted sweep angle of a point given in the station's frame, and its
 /// gradient with respect to that point.
-pub fn project(cal: &[AxisCal; 2], p: Vec3, axis: u8) -> (f64, Vec3) {
+pub fn project(cal: &[AxisCal; 2], p: Vec3, axis: u8) -> (Real, Vec3) {
     if axis == 0 {
         let (ang, g) = axis_model(&cal[0], p.x, p.y, -p.z, false);
         (ang, Vec3::new(g[0], g[1], -g[2]))
@@ -135,7 +136,7 @@ mod tests {
         // +x in the station frame is hit earlier on axis 0 (negative angle),
         // matching libsurvive's convention.
         let (a, _) = project(&c, Vec3::new(0.1, 0.0, -1.0), 0);
-        assert!((a + libm::atan2(0.1, 1.0)).abs() < 1e-12);
+        assert!((a + crate::math::atan2(0.1, 1.0)).abs() < 1e-12);
     }
 
     #[test]

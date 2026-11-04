@@ -1,5 +1,7 @@
-# Lighthouse tracking kernel: no_std + alloc, f64 math via libm (shared with
-# //swarm/core), no I/O. See src/lib.rs.
+# Lighthouse tracking kernel: no_std + alloc, math via libm, no I/O. See
+# src/lib.rs. Two builds of the same source: lh_kernel (f64, the hosts) and
+# lh_kernel_f32 (f32, FPUs without doubles: the ESP32-P4). Each has its
+# protocol/device twin, since those pass kernel types through.
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -14,4 +16,18 @@ rust_library(
 rust_test(
     name = "lh_kernel_test",
     crate = ":lh_kernel",
+)
+
+rust_library(
+    name = "lh_kernel_f32",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["f32"],
+    crate_name = "lh_kernel",
+    crate_root = "src/lib.rs",
+    deps = ["@lh_nostd_crates//:libm"],
+)
+
+rust_test(
+    name = "lh_kernel_f32_test",
+    crate = ":lh_kernel_f32",
 )

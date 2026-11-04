@@ -19,3 +19,15 @@ rust_test(
     name = "lh_protocol_test",
     crate = ":lh_protocol",
 )
+
+rust_library(
+    name = "lh_protocol_f32",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "lh_protocol",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//kernel:lh_kernel_f32",
+        "@lh_nostd_crates//:miniz_oxide",
+        "@lh_nostd_crates//:serde_json",
+    ],
+)
