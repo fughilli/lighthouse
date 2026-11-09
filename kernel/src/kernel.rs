@@ -182,9 +182,10 @@ pub struct KernelConfig {
     pub coast_after: Real,
     pub coast_interval: Real,
     /// On entering coasting, the velocity's standard deviation is capped at this (m/s per
-    /// axis; TrackState::cap_velocity_sigma). Tracking leaves it ~0.1-0.2 m/s, an artefact
-    /// of the inflated process noise that alone crosses `lost_sigma_pos` within ~0.1 s;
-    /// the velocity's real error at a lock is a few mm/s (2-7 mm/s simulated mid-carry).
+    /// axis; TrackState::cap_velocity_sigma). The tracking process noise (`accel_noise`, a
+    /// model-error budget) leaves it at a multiple of the velocity's real error at a lock
+    /// (~1-2 cm/s simulated mid-carry), which alone would cross `lost_sigma_pos` within
+    /// ~0.1 s of coasting.
     pub coast_vel_sigma: Real,
     /// Coasting ends in TrackingLost (Drifted) once the position uncertainty, sqrt of the
     /// covariance trace (m), or the orientation's (rad) passes these: the primary rule.
@@ -856,6 +857,9 @@ impl Kernel {
         let mut stats = UpdateStats::default();
         {
             let track = d.track.as_mut().unwrap();
+            if s.part == 0 {
+                track.begin_sweep(cfg.track.sigma_sweep);
+            }
             for (t, h) in &hits {
                 advance(track, &mut d.imu, *t, d.last_imu, &cfg.track);
                 let before = stats.used;
