@@ -26,18 +26,29 @@ use crate::timing::SensorHits;
 pub const GRAVITY: Real = 9.80665;
 /// Stations whose sweep-angle biases are estimated (per tracker).
 pub const MAX_STATIONS: usize = 4;
-const N: usize = 15 + 2 * MAX_STATIONS;
+const N: usize = 16 + 2 * MAX_STATIONS;
 const P: usize = 0;
 const V: usize = 3;
 const TH: usize = 6;
 const BG: usize = 9;
 const BA: usize = 12;
 const BANG: usize = 15;
+/// The current sweep's common-mode angle error (see `TrackConfig::sigma_sweep`).
+const CM: usize = BANG + 2 * MAX_STATIONS;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrackConfig {
-    /// Angle noise (rad, 1σ).
+    /// Angle noise per hit, independent between hits (rad, 1σ).
     pub sigma_angle: Real,
+    /// Angle error common to every hit of one sweep (rad, 1σ): calibration and model
+    /// residuals (OOTX factory terms, station pose, timing) vary slowly with the angle, so
+    /// the sensors of one sweep, a degree or two apart, share them. A state reset at each
+    /// sweep (`begin_sweep`) carries it, so a sweep's bearing is worth σ_sweep while the
+    /// differences between its hits, which give a lone station its range and the
+    /// orientation, are worth `sigma_angle`. Treating it as independent per-hit noise (one
+    /// 3 mrad figure) cost a lone station its range: σ ≈ 3 mrad · R² / (constellation
+    /// extent · √hits), ~8 cm at 3 m.
+    pub sigma_sweep: Real,
     /// Accelerometer white noise (m/s², 1σ per sample-second, i.e. m/s²·√s).
     pub accel_noise: Real,
     /// Gyro white noise (rad/s·√s).
@@ -68,11 +79,23 @@ impl TrackConfig {
 impl Default for TrackConfig {
     fn default() -> TrackConfig {
         TrackConfig {
-            // Per-hit noise is ~0.05-0.4 mrad, but calibration and model errors
-            // are correlated across hits; 3 mrad (with the IMU) tracked best on
-            // the recorded turntable/slider sessions.
-            sigma_angle: 3e-3,
-            accel_noise: 0.5,
+            // Per-hit timing noise is ~0.05-0.4 mrad; sensor-position (constellation)
+            // errors of ~0.5 mm add ~0.2 mrad at 3 m. A single 3 mrad per-hit figure
+            // tracked best on the recorded turntable/slider sessions because calibration and
+            // model errors are correlated across hits; those are the angle-bias states
+            // (persistent, per station/axis) and `sigma_sweep` (what varies sweep to sweep).
+            // As per-hit noise, 3 mrad cost a lone station its range (σ 15/40/74 mm carried
+            // at 1/2/3 m in splanc's firmware/p4/tracker/tests/reacquire.rs, against errors
+            // of 2/8/16 mm); split, with accel_noise 0.2, 4/9/16 mm against 1/2/5 mm.
+            // NOT YET RETUNED on the recorded sessions: replay them (tools/lh_replay)
+            // before relying on the 2-station figures there.
+            sigma_angle: 5e-4,
+            sigma_sweep: 1e-3,
+            // 0.5 was tuned with the 3 mrad figure. With the hit noise split out it left σ
+            // ~3.5x the error under motion (simulated, one station at 3 m: 21 mm against
+            // 6 mm); 0.2 gives 16 mm against 5 mm without failing a simulated scenario
+            // (fast swings at 2 m/s, 7 rad/s included). Also to retune on the recordings.
+            accel_noise: 0.2,
             gyro_noise: 0.01,
             accel_bias_walk: 1e-3,
             gyro_bias_walk: 1e-4,
@@ -96,6 +119,8 @@ pub struct TrackState {
     pub accel_bias: Vec3,
     /// Per (station slot, axis): `angle_bias[2 * slot + axis]` (rad).
     pub angle_bias: [Real; 2 * MAX_STATIONS],
+    /// The current sweep's common-mode angle error (rad); see `begin_sweep`.
+    pub sweep_common: Real,
     pub cov: Mat,
     /// Device time of the state (ticks, unwrapped).
     pub time: i64,
@@ -136,9 +161,21 @@ impl TrackState {
             gyro_bias: Vec3::ZERO,
             accel_bias: Vec3::ZERO,
             angle_bias: [0.0; 2 * MAX_STATIONS],
+            sweep_common: 0.0,
             cov,
             time,
         }
+    }
+
+    /// A new sweep starts: its common-mode error is a fresh N(0, sigma²), uncorrelated with
+    /// everything (the previous sweep's is forgotten).
+    pub fn begin_sweep(&mut self, sigma: Real) {
+        self.sweep_common = 0.0;
+        for k in 0..N {
+            self.cov[(CM, k)] = 0.0;
+            self.cov[(k, CM)] = 0.0;
+        }
+        self.cov[(CM, CM)] = sigma * sigma;
     }
 
     pub fn pose(&self) -> Pose {
@@ -261,6 +298,7 @@ impl TrackState {
         if let Some(b) = bias_idx {
             j.angle += self.angle_bias[b];
         }
+        j.angle += self.sweep_common;
         // Visible only in front of the station.
         if j.in_station.z >= 0.0 {
             return false;
@@ -273,8 +311,10 @@ impl TrackState {
         if let Some(b) = bias_idx {
             h[BANG + b] = 1.0;
         }
-        // S = H P Hᵀ + σ² + Js Σs Jsᵀ; H has at most 7 non-zeros (δp, δθ, one bias).
-        let mut nz = [0usize; 7];
+        h[CM] = 1.0;
+        // S = H P Hᵀ + σ² + Js Σs Jsᵀ; H has at most 8 non-zeros (δp, δθ, one bias, the
+        // sweep's common mode).
+        let mut nz = [0usize; 8];
         let mut nn = 0;
         for k in 0..N {
             if h[k] != 0.0 {
@@ -352,19 +392,29 @@ impl TrackState {
             let innov = -[self.vel.x, self.vel.y, self.vel.z][i];
             self.scalar_update(&h, innov, sigma_vel * sigma_vel);
         }
-        let f = accel_g.scale(GRAVITY).sub(self.accel_bias).normalized();
+        let fa = accel_g.scale(GRAVITY).sub(self.accel_bias);
+        let fn_ = fa.norm();
+        let f = fa.scale(1.0 / fn_);
         let r = rot_mat(self.rot);
-        // up = R f; d up / dθ = -R [f]x
+        // up = R f; d up / dθ = -R [f]x. And through the bias, f = (a g - b_a) / |a g - b_a|:
+        // d up / d b_a = -R (I - f fᵀ) / |a g - b_a|. Without that column a tilt the
+        // accelerometer bias causes can only be explained as a tilt of the tracker, which
+        // pulls the pose off the light by ~bias/g rad (20 mrad at 0.02 g).
         let fx = skew(f);
+        let fv = [f.x, f.y, f.z];
         for i in 0..2 {
             let up = self.rot.rotate(f);
             let mut h = [0.0; N];
             for c in 0..3 {
                 let mut v = 0.0;
+                let mut w = 0.0;
                 for k in 0..3 {
                     v += r[i][k] * fx[k][c];
+                    let proj = if k == c { 1.0 } else { 0.0 } - fv[k] * fv[c];
+                    w += r[i][k] * proj;
                 }
                 h[TH + c] = -v;
+                h[BA + c] = -w / fn_;
             }
             let innov = -[up.x, up.y][i];
             self.scalar_update(&h, innov, sigma_up * sigma_up);
@@ -406,6 +456,7 @@ impl TrackState {
         for i in 0..2 * MAX_STATIONS {
             self.angle_bias[i] += dx[BANG + i];
         }
+        self.sweep_common += dx[CM];
     }
 }
 
