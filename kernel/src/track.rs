@@ -49,6 +49,20 @@ pub struct TrackConfig {
     /// Sweep-angle bias: initial σ and random walk (rad, rad·√s⁻¹).
     pub angle_bias_init: Real,
     pub angle_bias_walk: Real,
+    /// Accelerometer and gyro white noise while dead reckoning in the dark (same units as
+    /// `accel_noise` / `gyro_noise`). Those are inflated for tracking (they absorb light vs
+    /// IMU timing and model error, which the light keeps correcting); with no light the
+    /// error that grows is the IMU's own: its noise and the biases' uncertainty, which the
+    /// bias states carry.
+    pub coast_accel_noise: Real,
+    pub coast_gyro_noise: Real,
+}
+
+impl TrackConfig {
+    /// The configuration for dead reckoning in the dark (see `coast_accel_noise`).
+    pub fn coasting(&self) -> TrackConfig {
+        TrackConfig { accel_noise: self.coast_accel_noise, gyro_noise: self.coast_gyro_noise, ..*self }
+    }
 }
 
 impl Default for TrackConfig {
@@ -67,6 +81,8 @@ impl Default for TrackConfig {
             // 30 Hz ripple (0.95 -> 0.03 mm) at ~0.1-0.3 mm cost on the turntables.
             angle_bias_init: 1e-3,
             angle_bias_walk: 2e-6,
+            coast_accel_noise: 0.05,
+            coast_gyro_noise: 0.005,
         }
     }
 }
@@ -127,6 +143,26 @@ impl TrackState {
 
     pub fn pose(&self) -> Pose {
         Pose { pos: self.pos, rot: self.rot }
+    }
+
+    /// Caps the velocity's standard deviation at `sigma` (m/s, per axis), scaling its rows
+    /// and columns so the correlations stay. For dead reckoning: the tracking process noise
+    /// (`accel_noise`) is a model-error budget that the light keeps correcting, and it
+    /// leaves the velocity variance ~50x the velocity's real error at a lock.
+    pub fn cap_velocity_sigma(&mut self, sigma: Real) {
+        for i in 0..3 {
+            let var = self.cov[(V + i, V + i)];
+            if !(var > sigma * sigma) {
+                continue;
+            }
+            let k = sigma / crate::math::sqrt(var);
+            for c in 0..N {
+                self.cov[(V + i, c)] *= k;
+            }
+            for r in 0..N {
+                self.cov[(r, V + i)] *= k;
+            }
+        }
     }
 
     /// 6x6 (δp, δθ) covariance of the pose.

@@ -156,6 +156,10 @@ pub enum LockLoss {
     Confidence,
     Silence,
     Ootx,
+    /// A sync flash one slot ahead of slot 0, cycle after cycle: the master's, so the lock
+    /// took the slave for slot 0 (it locked while only the slave was in view). What it
+    /// called slot 0 was slot 1.
+    SlotPhase,
 }
 
 /// Learned mapping from sync width to code: code = round((len - 2750 -
@@ -302,6 +306,9 @@ struct Lock {
     period: Real,
     confidence: i32,
     silent: u32,
+    /// Cycles in a row with a sync flash where the master's would be if this lock's slot 0
+    /// were really slot 1 (see LockLoss::SlotPhase).
+    early_syncs: u32,
     /// Last code per slot, to predict the next (tie-breaks).
     last_code: [Option<SyncCode>; 2],
 }
@@ -608,6 +615,7 @@ impl Timing {
                 period: CYCLE_TICKS as Real,
                 confidence: 20,
                 silent: 0,
+                early_syncs: 0,
                 last_code: [None, None],
             });
             self.stats.locks += 1;
@@ -692,6 +700,20 @@ impl Timing {
 
         // Sweep: whichever station isn't skipping; its axis from its code. What `clock`
         // already sent went as that station's; the rest goes out now, as its next part.
+        // One slot before the next cycle's slot 0 (81 deg into a sweep: outside every
+        // station's field of view, so no sweep hit lands there).
+        let early_at = lock.origin + lock.period as i64 - SLOT_TICKS as i64;
+        let early: Vec<(i64, u32, u8)> = self
+            .cycle_sweep
+            .iter()
+            .copied()
+            .filter(|p| self.is_sync_width_ext(p.1) && (p.0 - early_at).abs() < SLOT_TOLERANCE)
+            .collect();
+        if !early.is_empty() && group_stats(&early).0 >= min_sensors {
+            lock.early_syncs += 1;
+        } else {
+            lock.early_syncs = 0;
+        }
         if min_sensors > 1 && coincident_sync_flash(&self.cycle_sweep, min_sensors) {
             self.stats.misplaced_flashes += 1;
             lock.confidence -= 1;
@@ -758,6 +780,8 @@ impl Timing {
             self.drop_lock(LockLoss::Silence, out);
         } else if ootx_bad {
             self.drop_lock(LockLoss::Ootx, out);
+        } else if lock.early_syncs >= 8 {
+            self.drop_lock(LockLoss::SlotPhase, out);
         }
     }
 
