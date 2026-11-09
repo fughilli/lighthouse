@@ -430,7 +430,7 @@ fn emit(e: &Event, devs: &HashMap<String, u32>, t0: i64, out: &mut impl Write, e
     if let Some(w) = events {
         let line = match e {
             Event::Pose { .. } => return,
-            Event::Calibrated { reason, stations, scenes, dropped, tracker_up_error } => {
+            Event::Calibrated { reason, stations, scenes, dropped, tracker_up_error, .. } => {
                 let st: Vec<String> = stations
                     .iter()
                     .map(|s| {

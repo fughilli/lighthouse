@@ -1,6 +1,6 @@
 # lhd: the lighthouse tracking daemon (transport → protocol → kernel → JSON
 # lines). See src/main.rs.
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "lhd",
@@ -32,4 +32,10 @@ rust_binary(
         "@lh_host_crates//:flate2",
         "@lh_host_crates//:serde_json",
     ],
+)
+
+# lhd's unit tests (CLI parsing, calibration store): no device needed.
+rust_test(
+    name = "lhd_test",
+    crate = ":lhd",
 )
