@@ -90,8 +90,22 @@ pub enum Event {
     /// The device's pose ("head" frame) in the world. `cov` is 6x6 over
     /// (position, rotation), both in world axes; `time` device ticks
     /// (unwrapped); `light` the device time of the newest hit in it (the pose is
-    /// propagated past it to the newest IMU sample, `time`).
-    Pose { dev: DeviceId, time: i64, light: i64, world_from_head: Pose, world_from_body: Pose, velocity: Vec3, cov: Mat, used: u32, gated: u32 },
+    /// propagated past it to the newest IMU sample, `time`). `speculative`: no hit has been
+    /// used for `coast_after` (KernelConfig): the pose is the IMU's dead reckoning since
+    /// the light was lost, published every `coast_interval` until light confirms it again
+    /// or its covariance passes `lost_sigma_pos` / `lost_sigma_rot` (then TrackingLost).
+    Pose {
+        dev: DeviceId,
+        time: i64,
+        light: i64,
+        world_from_head: Pose,
+        world_from_body: Pose,
+        velocity: Vec3,
+        cov: Mat,
+        used: u32,
+        gated: u32,
+        speculative: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +125,11 @@ pub enum TrackLoss {
     Diverged,
     /// The station calibration was dropped (see [`CalibrationReason::StationsMoved`]).
     StationsMoved,
+    /// Dead reckoning in the dark grew past `lost_sigma_pos` / `lost_sigma_rot`.
+    Drifted,
+    /// The light that came back after coasting disagreed with the dead-reckoned state
+    /// (most hits gated): a fresh pose solve follows.
+    Inconsistent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,8 +164,26 @@ pub struct KernelConfig {
     pub still_sigma_up: Real,
     /// Tracking is dropped after this many gated hits in a row.
     pub lost_after_gated: u32,
-    /// ... or this long without a used hit (s).
+    /// Coasting: no hit used for this long (s), and the tracker is dead reckoned on the IMU
+    /// (the filter's own propagation, at `TrackConfig::coast_*_noise`), its pose published
+    /// as speculative every `coast_interval` (s).
+    pub coast_after: Real,
+    pub coast_interval: Real,
+    /// On entering coasting, the velocity's standard deviation is capped at this (m/s per
+    /// axis; TrackState::cap_velocity_sigma). Tracking leaves it ~0.1-0.2 m/s, an artefact
+    /// of the inflated process noise that alone crosses `lost_sigma_pos` within ~0.1 s;
+    /// the velocity's real error at a lock is a few mm/s (2-7 mm/s simulated mid-carry).
+    pub coast_vel_sigma: Real,
+    /// Coasting ends in TrackingLost (Drifted) once the position uncertainty, sqrt of the
+    /// covariance trace (m), or the orientation's (rad) passes these: the primary rule.
+    pub lost_sigma_pos: Real,
+    pub lost_sigma_rot: Real,
+    /// The backstop: at most this long without a used hit (s), whatever the covariance
+    /// says (TrackingLost NoLight).
     pub lost_after_dark: Real,
+    /// Light back after coasting: of the first this many hits, at least half must pass the
+    /// gate against the dead-reckoned state, or it was wrong (TrackingLost Inconsistent).
+    pub coast_check_hits: u32,
     /// The stations count as moved when single-station poses of a still
     /// tracker differ by more than these (m, rad) in `moved_after` scenes in
     /// a row. A good calibration agrees to ~1 cm.
@@ -184,7 +221,13 @@ impl Default for KernelConfig {
             still_sigma_vel: 0.01,
             still_sigma_up: 0.02,
             lost_after_gated: 60,
-            lost_after_dark: 0.5,
+            coast_after: 0.05,
+            coast_interval: 0.008,
+            coast_vel_sigma: 0.03,
+            lost_sigma_pos: 0.02,
+            lost_sigma_rot: 0.05,
+            lost_after_dark: 1.0,
+            coast_check_hits: 8,
             moved_pos: 0.05,
             moved_rot: (3.0 as Real).to_radians(),
             moved_after: 3,
@@ -318,6 +361,12 @@ struct Device {
     track: Option<TrackState>,
     recent: VecDeque<(u32, u8, Vec<SensorHits>)>,
     gated_run: u32,
+    /// Dead reckoning since the light was lost (KernelConfig::coast_after); its last
+    /// speculative pose (IMU time), and the hits used / gated since light came back.
+    coasting: bool,
+    last_coast_pub: i64,
+    coast_used: u32,
+    coast_gated: u32,
     /// IMU time of the last start attempt (cfg.start_interval).
     last_start: Option<i64>,
     last_used: i64,
@@ -379,6 +428,10 @@ impl Kernel {
                     track: None,
                     recent: VecDeque::new(),
                     gated_run: 0,
+                    coasting: false,
+                    last_coast_pub: 0,
+                    coast_used: 0,
+                    coast_gated: 0,
                     last_start: None,
                     last_used: 0,
                     window: UpdateStats::default(),
@@ -507,21 +560,64 @@ impl Kernel {
             }
         }
         let d = &mut self.devices[di];
-        // No usable light for too long: lost, judged on the IMU clock too (a sweep's
-        // own check never runs while both stations are blocked, and the filter would
-        // coast on the IMU, "tracking", for as long as the dark lasts).
-        if d.track.is_some() && (t - d.last_used) as Real / TPS > cfg.lost_after_dark {
-            d.track = None;
-            d.recent.clear();
-            out.push(Event::TrackingLost { dev, reason: TrackLoss::NoLight });
+        // In the dark (no hit used for coast_after): dead reckon on the IMU, judged on the
+        // IMU clock (no sweep comes while both stations are blocked).
+        let dark = (t - d.last_used) as Real / TPS;
+        let coast = d.track.is_some() && dark > cfg.coast_after;
+        let tc = if coast { cfg.track.coasting() } else { cfg.track };
+        if coast && !d.coasting {
+            d.coasting = true;
+            if let Some(track) = d.track.as_mut() {
+                track.cap_velocity_sigma(cfg.coast_vel_sigma);
+            }
+            d.coast_used = 0;
+            d.coast_gated = 0;
+            d.last_coast_pub = 0;
         }
         if still && cfg.still_updates {
             if let Some(track) = d.track.as_mut() {
                 if t > track.time {
                     // Bring the filter up to this sample first (it may lag the light).
-                    advance(track, &mut d.imu, t, d.last_imu, &cfg.track);
+                    advance(track, &mut d.imu, t, d.last_imu, &tc);
                 }
                 track.update_still(accel_g, cfg.still_sigma_vel, cfg.still_sigma_up);
+            }
+        }
+        if coast {
+            let track = d.track.as_mut().unwrap();
+            if t > track.time {
+                advance(track, &mut d.imu, t, d.last_imu, &tc);
+            }
+            let (sp, sr) = sigmas(track);
+            let loss = if dark > cfg.lost_after_dark {
+                Some(TrackLoss::NoLight)
+            } else if !(sp <= cfg.lost_sigma_pos && sr <= cfg.lost_sigma_rot) {
+                Some(TrackLoss::Drifted)
+            } else {
+                None
+            };
+            if let Some(reason) = loss {
+                d.track = None;
+                d.coasting = false;
+                d.recent.clear();
+                out.push(Event::TrackingLost { dev, reason });
+            } else if (t - d.last_coast_pub) as Real >= cfg.coast_interval * TPS {
+                d.last_coast_pub = t;
+                let track = d.track.as_ref().unwrap();
+                let (pose, cov) = head_pose(track, &d.model.body_from_head);
+                out.push(Event::Pose {
+                    dev,
+                    time: track.time,
+                    light: d.last_used,
+                    world_from_head: pose,
+                    world_from_body: track.pose(),
+                    velocity: track.vel,
+                    cov,
+                    used: 0,
+                    gated: d.window.gated,
+                    speculative: true,
+                });
+                d.window = UpdateStats::default();
             }
         }
         if still {
@@ -762,6 +858,18 @@ impl Kernel {
         }
         d.window.used += stats.used;
         d.window.gated += stats.gated;
+        // Light back after coasting: fused into the dead-reckoned track if it agrees (most
+        // of the first hits pass the gate), else that state was wrong and a fresh solve
+        // takes over.
+        let mut inconsistent = false;
+        if d.coasting && stats.used + stats.gated > 0 {
+            d.coast_used += stats.used;
+            d.coast_gated += stats.gated;
+            if d.coast_used + d.coast_gated >= cfg.coast_check_hits {
+                inconsistent = d.coast_used * 2 < d.coast_used + d.coast_gated;
+                d.coasting = false;
+            }
+        }
         if stats.used > 0 {
             d.gated_run = 0;
             d.last_used = hits.last().map_or(d.last_used, |h| h.0);
@@ -772,7 +880,9 @@ impl Kernel {
         let now = hits.last().map_or(track.time, |h| h.0);
         let dark = (now - d.last_used) as Real / TPS;
         let trace: Real = (0..3).map(|i| track.cov[(i, i)]).sum();
-        let loss = if d.gated_run >= cfg.lost_after_gated {
+        let loss = if inconsistent {
+            Some(TrackLoss::Inconsistent)
+        } else if d.gated_run >= cfg.lost_after_gated {
             Some(TrackLoss::Gated)
         } else if dark > cfg.lost_after_dark {
             Some(TrackLoss::NoLight)
@@ -783,6 +893,7 @@ impl Kernel {
         };
         if let Some(reason) = loss {
             d.track = None;
+            d.coasting = false;
             d.recent.clear();
             out.push(Event::TrackingLost { dev: d.id, reason });
             return;
@@ -805,6 +916,7 @@ impl Kernel {
             cov,
             used: d.window.used,
             gated: d.window.gated,
+            speculative: d.coasting || dark > cfg.coast_after,
         });
         d.window = UpdateStats::default();
     }
@@ -868,6 +980,7 @@ impl Kernel {
         d.track = Some(TrackState::new(&sol.world_from_body, &sol.cov.scale(4.0), t, cfg.track.angle_bias_init));
         d.last_used = t;
         d.gated_run = 0;
+        d.coasting = false;
         d.recent.clear();
         out.push(Event::TrackingStarted { dev: d.id, rms: sol.rms });
     }
@@ -1145,6 +1258,14 @@ fn advance(track: &mut TrackState, imu: &mut VecDeque<(i64, Vec3, Vec3)>, t: i64
             None => track.coast(t, cfg),
         }
     }
+}
+
+/// sqrt of the position and orientation covariance traces (m, rad).
+fn sigmas(st: &TrackState) -> (Real, Real) {
+    let c = st.pose_cov();
+    let tp = c[(0, 0)] + c[(1, 1)] + c[(2, 2)];
+    let tr = c[(3, 3)] + c[(4, 4)] + c[(5, 5)];
+    (crate::math::sqrt(tp.max(0.0)), crate::math::sqrt(tr.max(0.0)))
 }
 
 /// The head pose and its covariance (position, rotation; world axes).
