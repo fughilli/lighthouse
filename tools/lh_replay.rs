@@ -5,6 +5,9 @@
 //!   lh_replay captures/vive/X.rec.gz --out poses.txt [--events events.jsonl]
 //!             [--stations libsurvive-config.json] [--no-auto-calibrate] [--clock]
 //!
+//! Each pose also writes "<t> <dev> SIGMA <m> <speculative>": the head position's σ (sqrt of
+//! its covariance trace). --set sigma_sweep=... with the other --set keys.
+//!
 //! --save-stations FILE: each calibration's stations, in the --stations format (to replay
 //! another run on the same stations with --no-auto-calibrate).
 //!
@@ -170,6 +173,7 @@ fn main() {
         let v: f64 = v.parse().expect("number");
         match k {
             "sigma_angle" => cfg.track.sigma_angle = v,
+            "sigma_sweep" => cfg.track.sigma_sweep = v,
             "accel_noise" => cfg.track.accel_noise = v,
             "gyro_noise" => cfg.track.gyro_noise = v,
             "gate" => cfg.track.gate = v,
@@ -385,8 +389,12 @@ fn emit(e: &Event, devs: &HashMap<String, u32>, t0: i64, out: &mut impl Write, e
         std::fs::write(path, serde_json::json!({ "stations": st }).to_string()).unwrap();
     }
     let name = |d: u32| devs.iter().find(|(_, v)| **v == d).map(|(k, _)| k.clone()).unwrap_or_default();
-    if let Event::Pose { dev, time, used, gated, world_from_body: b, .. } = e {
+    if let Event::Pose { dev, time, used, gated, world_from_body: b, cov, speculative, .. } = e {
         writeln!(out, "{:.6} {} USEDGATED {} {}", (*time - t0) as f64 / 48e6, name(*dev), used, gated).unwrap();
+        // The head position's uncertainty (sqrt of the covariance trace, m), and whether the
+        // pose is dead reckoning.
+        let sp = (cov[(0, 0)] + cov[(1, 1)] + cov[(2, 2)]).max(0.0).sqrt();
+        writeln!(out, "{:.6} {} SIGMA {:.6} {}", (*time - t0) as f64 / 48e6, name(*dev), sp, *speculative as u8).unwrap();
         writeln!(
             out,
             "{:.6} {} POSEBODY {:.6} {:.6} {:.6} {:.6} {:.6} {:.6} {:.6}",

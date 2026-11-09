@@ -79,22 +79,21 @@ impl TrackConfig {
 impl Default for TrackConfig {
     fn default() -> TrackConfig {
         TrackConfig {
-            // Per-hit timing noise is ~0.05-0.4 mrad; sensor-position (constellation)
-            // errors of ~0.5 mm add ~0.2 mrad at 3 m. A single 3 mrad per-hit figure
+            // Per-hit timing noise is ~0.05-0.4 mrad, and sensor-position (constellation)
+            // errors of ~0.5 mm add ~0.2 mrad at 3 m; streamed sweeps over a wireless link
+            // carry more (sync-code and timing errors). A single 3 mrad per-hit figure
             // tracked best on the recorded turntable/slider sessions because calibration and
             // model errors are correlated across hits; those are the angle-bias states
             // (persistent, per station/axis) and `sigma_sweep` (what varies sweep to sweep).
-            // As per-hit noise, 3 mrad cost a lone station its range (σ 15/40/74 mm carried
-            // at 1/2/3 m in splanc's firmware/p4/tracker/tests/reacquire.rs, against errors
-            // of 2/8/16 mm); split, with accel_noise 0.2, 4/9/16 mm against 1/2/5 mm.
-            // NOT YET RETUNED on the recorded sessions: replay them (tools/lh_replay)
-            // before relying on the 2-station figures there.
-            sigma_angle: 5e-4,
-            sigma_sweep: 1e-3,
-            // 0.5 was tuned with the 3 mrad figure. With the hit noise split out it left σ
-            // ~3.5x the error under motion (simulated, one station at 3 m: 21 mm against
-            // 6 mm); 0.2 gives 16 mm against 5 mm without failing a simulated scenario
-            // (fast swings at 2 m/s, 7 rad/s included). Also to retune on the recordings.
+            // As per-hit noise, 3 mrad cost a lone station its range. Chosen by replaying
+            // the recorded sessions (fughilli/lighthouse#4 has the table): with one station,
+            // turntable radial RMS 39 -> 6 mm and 11 -> 5 mm; two stations unchanged, streamed
+            // included. 0.5 mrad per hit with 1 mrad per sweep was better still in simulation
+            // but diverged (80 mm) on the streamed wireless turntable.
+            sigma_angle: 1e-3,
+            sigma_sweep: 2e-3,
+            // 0.5 was tuned with the 3 mrad figure; with the hit noise split, 0.2 replays as
+            // well or better on every recorded session and keeps σ near the error.
             accel_noise: 0.2,
             gyro_noise: 0.01,
             accel_bias_walk: 1e-3,
