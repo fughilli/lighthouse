@@ -302,6 +302,14 @@ struct Device {
     model: TrackerModel,
     timing: Timing,
     slot_station: [Option<u32>; 2],
+    /// The stations the slots had before the sweep-timing lock was lost. A re-lock puts
+    /// them back once sweeps have come from both slots (which pins the cycle phase, so slot
+    /// 0 is the master again), instead of waiting ~3-6 s for each station's next OOTX
+    /// packet; the OOTX that follows confirms or corrects them.
+    prev_slot_station: [Option<u32>; 2],
+    /// Since the re-lock, sweeps seen per slot (bit per slot), while `prev_slot_station`
+    /// waits to be put back.
+    relock_slots: u8,
     clock: Clock,
     imu: VecDeque<(i64, Vec3, Vec3)>,
     last_imu: Option<(i64, Vec3, Vec3)>,
@@ -361,6 +369,8 @@ impl Kernel {
                     model,
                     timing,
                     slot_station: [None, None],
+                    prev_slot_station: [None, None],
+                    relock_slots: 0,
                     clock: Clock::default(),
                     imu: VecDeque::new(),
                     last_imu: None,
@@ -497,6 +507,14 @@ impl Kernel {
             }
         }
         let d = &mut self.devices[di];
+        // No usable light for too long: lost, judged on the IMU clock too (a sweep's
+        // own check never runs while both stations are blocked, and the filter would
+        // coast on the IMU, "tracking", for as long as the dark lasts).
+        if d.track.is_some() && (t - d.last_used) as Real / TPS > cfg.lost_after_dark {
+            d.track = None;
+            d.recent.clear();
+            out.push(Event::TrackingLost { dev, reason: TrackLoss::NoLight });
+        }
         if still && cfg.still_updates {
             if let Some(track) = d.track.as_mut() {
                 if t > track.time {
@@ -593,14 +611,42 @@ impl Kernel {
     fn timing_event(&mut self, di: usize, e: TimingEvent, out: &mut Vec<Event>) {
         let dev = self.devices[di].id;
         match e {
-            TimingEvent::Locked { .. } => out.push(Event::TimingLocked { dev }),
+            TimingEvent::Locked { .. } => {
+                self.devices[di].relock_slots = 0;
+                out.push(Event::TimingLocked { dev });
+            }
             TimingEvent::LockLost { reason } => {
-                self.devices[di].slot_station = [None, None];
+                let d = &mut self.devices[di];
+                if reason == LockLoss::SlotPhase {
+                    // What this lock called slot 0 was the slave's slot.
+                    if let Some(s) = d.slot_station[0] {
+                        d.prev_slot_station[1] = Some(s);
+                        if d.prev_slot_station[0] == Some(s) {
+                            d.prev_slot_station[0] = None;
+                        }
+                    }
+                } else {
+                    for slot in 0..2 {
+                        if d.slot_station[slot].is_some() {
+                            d.prev_slot_station[slot] = d.slot_station[slot];
+                        }
+                    }
+                }
+                d.slot_station = [None, None];
+                d.relock_slots = 0;
                 out.push(Event::TimingLost { dev, reason });
             }
             TimingEvent::Station { slot, info } => {
-                let changed = self.devices[di].slot_station[slot as usize] != Some(info.id);
-                self.devices[di].slot_station[slot as usize] = Some(info.id);
+                let d = &mut self.devices[di];
+                let was = d.slot_station[slot as usize];
+                let changed = was != Some(info.id);
+                d.slot_station[slot as usize] = Some(info.id);
+                // A slot put back after a re-lock turned out to be another station: what
+                // was tracked with it is wrong.
+                if was.is_some() && changed && d.track.take().is_some() {
+                    d.recent.clear();
+                    out.push(Event::TrackingLost { dev, reason: TrackLoss::StationsMoved });
+                }
                 let si = self.station_index(info.id);
                 let st = &mut self.stations[si];
                 let new_info = st.info.as_ref() != Some(&info);
@@ -619,6 +665,19 @@ impl Kernel {
     }
 
     fn sweep(&mut self, di: usize, s: Sweep, out: &mut Vec<Event>) {
+        {
+            let d = &mut self.devices[di];
+            if d.relock_slots != 3 && d.slot_station.contains(&None) && d.prev_slot_station != [None, None] {
+                d.relock_slots |= 1 << (s.slot & 1);
+                if d.relock_slots == 3 {
+                    for slot in 0..2 {
+                        if d.slot_station[slot].is_none() {
+                            d.slot_station[slot] = d.prev_slot_station[slot];
+                        }
+                    }
+                }
+            }
+        }
         let Some(sid) = self.devices[di].slot_station[s.slot as usize] else { return };
         if let Some(sb) = self.devices[di].scene.as_mut() {
             sb.add(sid, s.axis, &s.hits);
