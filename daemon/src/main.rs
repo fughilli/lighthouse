@@ -2,6 +2,7 @@
 //!
 //!   lhd [--replay REC.gz [--speed 1.0]] [--calibration FILE.json] [--record FILE.rec.gz]
 //!       [--host-clock [--stream-sweeps]] [--pose-timing]
+//!   lhd --help | --version       (exit at once; no device is opened)
 //!
 //! --host-clock maps each device's clock onto the report timestamps and tells the kernel
 //! which device time has passed (Input::Clock, every ms), so a sweep goes out once the laser
@@ -19,15 +20,19 @@
 //!   {"cmd":"haptic","serial":"…"}  buzz a tracker
 //!
 //! Output events (one JSON object per line, "type" first): device, timing,
-//! station, still, calibrated, tracking, pose, imu (decimated), battery, log.
+//! station, still, calibrated (its "pending": stations seen but not yet placed),
+//! calibration_skipped (a calibration that changed nothing, and why), tracking, pose,
+//! imu (decimated), battery, log.
 //! Poses are the tracker's head frame in the world (z up, metres),
 //! quaternions w-first, covariance 6x6 row-major over (position, rotation)
 //! in world axes.
 
+mod cli;
 mod devices;
 mod record;
 mod store;
 
+use cli::{Command, Options};
 use devices::{DeviceManager, Note};
 use lh_kernel::kernel::{Event, Kernel, KernelConfig};
 use lh_transport::hid::HidTransport;
@@ -39,18 +44,55 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let calib_path = opt("--calibration");
-    let speed: f64 = opt("--speed").and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = start(&args, &mut std::io::stdout(), &mut std::io::stderr(), open_transport);
+    std::process::exit(code);
+}
 
-    let mut transport: Box<dyn Transport> = match opt("--replay") {
-        Some(p) => Box::new(ReplayTransport::open(&p, speed).expect("open replay")),
-        None => Box::new(HidTransport::new().expect("hidapi")),
+/// The live receivers (hidapi) or a recording.
+fn open_transport(o: &Options) -> Result<Box<dyn Transport>, String> {
+    match &o.replay {
+        Some(p) => ReplayTransport::open(p, o.speed).map(|t| Box::new(t) as Box<dyn Transport>).map_err(|e| format!("opening replay {}: {:?}", p, e)),
+        None => HidTransport::new().map(|t| Box::new(t) as Box<dyn Transport>).map_err(|e| format!("opening the USB receivers (hidapi): {:?}", e)),
+    }
+}
+
+/// Parses the arguments; `--help`, `--version` and argument errors are answered here,
+/// before `open` (the transport: the USB receivers) is called. Otherwise tracks until a
+/// replay ends. Returns the exit code.
+fn start(args: &[String], out: &mut dyn Write, err: &mut dyn Write, open: impl FnOnce(&Options) -> Result<Box<dyn Transport>, String>) -> i32 {
+    let opts = match cli::parse(args) {
+        Ok(Command::Help) => {
+            write!(out, "{}", cli::USAGE).ok();
+            return 0;
+        }
+        Ok(Command::Version) => {
+            writeln!(out, "lhd {}", option_env!("CARGO_PKG_VERSION").unwrap_or("dev")).ok();
+            return 0;
+        }
+        Ok(Command::Run(o)) => o,
+        Err(e) => {
+            writeln!(err, "lhd: {}\n(lhd --help for usage)", e).ok();
+            return 2;
+        }
     };
-    let replay = opt("--replay").is_some();
+    match open(&opts) {
+        Ok(t) => {
+            track(&opts, t);
+            0
+        }
+        Err(e) => {
+            writeln!(err, "lhd: {}", e).ok();
+            1
+        }
+    }
+}
 
-    let stream = args.iter().any(|a| a == "--stream-sweeps");
+fn track(opts: &Options, mut transport: Box<dyn Transport>) {
+    let calib_path = opts.calibration.clone();
+    let replay = opts.replay.is_some();
+
+    let stream = opts.stream_sweeps;
     let mut cfg = KernelConfig::default();
     cfg.timing.stream_sweeps = stream;
     let mut kernel = Kernel::new(cfg);
@@ -75,8 +117,8 @@ fn main() {
     }
 
     let mut recorder = record::Recorder::default();
-    if let Some(p) = opt("--record") {
-        if let Err(e) = recorder.start(&p) {
+    if let Some(p) = &opts.record {
+        if let Err(e) = recorder.start(p) {
             emit(&mut out, json!({"type":"log","msg":format!("record: {}", e)}));
         }
     }
@@ -95,8 +137,8 @@ fn main() {
     });
 
     let mut mgr = DeviceManager::new();
-    mgr.host_clock = args.iter().any(|a| a == "--host-clock");
-    mgr.pose_timing = args.iter().any(|a| a == "--pose-timing");
+    mgr.host_clock = opts.host_clock;
+    mgr.pose_timing = opts.pose_timing;
     mgr.stream = stream;
     let mut notes: Vec<Note> = Vec::new();
     let start = Instant::now();
@@ -176,7 +218,7 @@ fn event_json(e: &Event, mgr: &DeviceManager) -> Option<Value> {
             "accel":info.accel_dir,"fw":info.fw_version,"unlock_count":info.unlock_count
         }),
         Event::Still { dev, still } => json!({"type":"still","serial":serial(*dev),"still":still}),
-        Event::Calibrated { reason, stations, scenes, dropped, tracker_up_error } => {
+        Event::Calibrated { reason, stations, scenes, dropped, tracker_up_error, pending } => {
             let st: Vec<Value> = stations
                 .iter()
                 .map(|s| {
@@ -185,7 +227,10 @@ fn event_json(e: &Event, mgr: &DeviceManager) -> Option<Value> {
                 })
                 .collect();
             json!({"type":"calibrated","reason":format!("{:?}",reason),"scenes":scenes,"dropped":dropped,
-                   "tracker_up_error":tracker_up_error,"stations":st})
+                   "tracker_up_error":tracker_up_error,"stations":st,"pending":pending})
+        }
+        Event::CalibrationSkipped { reason, why } => {
+            json!({"type":"calibration_skipped","reason":format!("{:?}",reason),"why":why})
         }
         Event::StationsDisagree { dev, pos, rot, count } => json!({"type":"stations_disagree","serial":serial(*dev),
             "pos_m":pos,"rot_deg":rot.to_degrees(),"count":count}),
@@ -197,4 +242,51 @@ fn event_json(e: &Event, mgr: &DeviceManager) -> Option<Value> {
                    "v":[velocity.x,velocity.y,velocity.z],"cov":cov.d,"used":used,"gated":gated})
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Runs `start` with a transport factory that only records being called (and fails, so
+    /// a run stops right there).
+    fn start_spy(args: &[&str]) -> (i32, bool, String, String) {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let opened = Cell::new(false);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = start(&args, &mut out, &mut err, |_| {
+            opened.set(true);
+            Err("spy: no device".into())
+        });
+        (code, opened.get(), String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    #[test]
+    fn help_and_version_open_no_device() {
+        for a in [&["--help"][..], &["-h"], &["--calibration", "c.json", "--help"], &["--version"], &["-V"]] {
+            let (code, opened, out, _) = start_spy(a);
+            assert_eq!(code, 0, "{:?}", a);
+            assert!(!opened, "{:?} opened the transport", a);
+            assert!(out.starts_with("usage: lhd") || out.starts_with("lhd "), "{:?}: {}", a, out);
+        }
+    }
+
+    #[test]
+    fn argument_errors_open_no_device() {
+        for a in [&["--bogus"][..], &["--calibration"], &["--speed", "2"], &["--replay", "r.gz", "--speed", "x"]] {
+            let (code, opened, _, err) = start_spy(a);
+            assert_eq!(code, 2, "{:?}", a);
+            assert!(!opened, "{:?} opened the transport", a);
+            assert!(err.starts_with("lhd: "), "{:?}: {}", a, err);
+        }
+    }
+
+    #[test]
+    fn a_run_opens_the_transport_and_reports_failure() {
+        let (code, opened, _, err) = start_spy(&["--calibration", "c.json"]);
+        assert!(opened);
+        assert_eq!(code, 1);
+        assert!(err.contains("spy: no device"), "{}", err);
+    }
 }
