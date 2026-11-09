@@ -51,6 +51,10 @@ struct Dev {
 pub struct DeviceManager {
     devs: Vec<Dev>,
     next_kernel_id: u32,
+    /// Kernel device id per tracker serial: a tracker that drops off the radio and comes
+    /// back keeps its id, so the kernel can still use the still scenes it collected
+    /// before (calibration needs their device's sensor model).
+    kernel_ids: Vec<(String, u32)>,
     now: Duration,
     /// --host-clock: map each device's clock onto the report timestamps and tick the kernel
     /// with it (1 ms of host time apart, like the P4), so a sweep goes out once the laser
@@ -107,7 +111,7 @@ fn set(t: &mut dyn Transport, dev: &Dev, data: &[u8], rec: &mut Recorder) -> boo
 
 impl DeviceManager {
     pub fn new() -> DeviceManager {
-        DeviceManager { devs: Vec::new(), next_kernel_id: 0, now: Duration::ZERO, host_clock: false, pose_timing: false, stream: false }
+        DeviceManager { devs: Vec::new(), next_kernel_id: 0, kernel_ids: Vec::new(), now: Duration::ZERO, host_clock: false, pose_timing: false, stream: false }
     }
 
     /// Set the clock before handling a batch. A handshake blocks the loop for a
@@ -115,6 +119,26 @@ impl DeviceManager {
     /// previous tick's time, those would look like their trackers going quiet.
     pub fn set_now(&mut self, now: Duration) {
         self.now = now;
+    }
+
+    /// The kernel id for a tracker serial: the one it had before, else a new one. Two
+    /// devices streaming at once never share one (an empty serial always gets a new id).
+    fn kernel_id(&mut self, serial: &str) -> u32 {
+        let in_use = |id: u32, devs: &[Dev]| devs.iter().filter_map(|d| d.dec.as_ref()).any(|x| x.dev == id);
+        if !serial.is_empty() {
+            if let Some(&(_, id)) = self.kernel_ids.iter().find(|x| x.0 == serial) {
+                if !in_use(id, &self.devs) {
+                    return id;
+                }
+            }
+        }
+        let id = self.next_kernel_id;
+        self.next_kernel_id += 1;
+        if !serial.is_empty() {
+            self.kernel_ids.retain(|x| x.0 != serial);
+            self.kernel_ids.push((serial.to_string(), id));
+        }
+        id
     }
 
     pub fn serial_of(&self, kernel_id: u32) -> Option<String> {
@@ -255,8 +279,7 @@ impl DeviceManager {
                     self.devs[i].kind,
                 ) {
                     Ok((config, imu)) => {
-                        let id = self.next_kernel_id;
-                        self.next_kernel_id += 1;
+                        let id = self.kernel_id(&config.serial);
                         let d = &mut self.devs[i];
                         // Sensors in the head frame (the frame poses are reported in), for viewers.
                         let head_from_body = config.model.body_from_head.inverse();
@@ -345,5 +368,24 @@ fn iface_name(role: Option<Interface>) -> &'static str {
         Some(Interface::Lightcap) => "Lightcap",
         Some(Interface::Buttons) => "Buttons",
         None => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tracker_that_reconnects_keeps_its_kernel_id() {
+        let mut m = DeviceManager::new();
+        let a = m.kernel_id("LHR-AAAA");
+        let b = m.kernel_id("LHR-BBBB");
+        assert_ne!(a, b);
+        // Disconnected (no decoder streaming), then handshaken again.
+        assert_eq!(m.kernel_id("LHR-AAAA"), a);
+        assert_eq!(m.kernel_id("LHR-BBBB"), b);
+        // No serial: always a fresh id.
+        let e = m.kernel_id("");
+        assert_ne!(m.kernel_id(""), e);
     }
 }
