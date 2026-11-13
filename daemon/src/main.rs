@@ -1,6 +1,6 @@
 //! lhd: the lighthouse tracking daemon.
 //!
-//!   lhd [--replay REC.gz [--speed 1.0]] [--calibration FILE.json] [--record FILE.rec.gz]
+//!   lhd [--replay REC.gz [--speed 1.0]] [--calibration FILE.json [--load-calibration]] [--record FILE.rec.gz]
 //!       [--host-clock [--stream-sweeps]] [--pose-timing]
 //!   lhd --help | --version       (exit at once; no device is opened)
 //!
@@ -9,6 +9,11 @@
 //! has passed instead of at the next cycle's sync. With it or --pose-timing alone, each pose
 //! also gets a "pose_timing" line: its light and pose times on the host clock, and when it
 //! came out. --stream-sweeps sends each sweep's hits as they come (TimingConfig::stream_sweeps).
+//!
+//! Stations are solved afresh at every start (FILE gets each new calibration); with
+//! --load-calibration FILE's stations are the starting point instead. A station no tracker
+//! has seen for a while is dropped ("station_dropped"), and one tilted in place is levelled
+//! again from its OOTX gravity ("calibrated", reason "StationTilted").
 //!
 //! Transport (live hidapi, or a recording) → lh_protocol (device handshake,
 //! report decoding) → lh_kernel → JSON lines on stdout. Commands come in as
@@ -100,7 +105,10 @@ fn track(opts: &Options, mut transport: Box<dyn Transport>) {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    if let Some(p) = &calib_path {
+    if let (Some(p), false) = (&calib_path, opts.load_calibration) {
+        emit(&mut out, json!({"type":"log","msg":format!("solving the stations afresh (saving to {}; --load-calibration starts from it)", p)}));
+    }
+    if let (Some(p), true) = (&calib_path, opts.load_calibration) {
         match store::load(p) {
             Ok(inputs) => {
                 let n = inputs.len();
@@ -236,6 +244,7 @@ fn event_json(e: &Event, mgr: &DeviceManager) -> Option<Value> {
             "pos_m":pos,"rot_deg":rot.to_degrees(),"count":count}),
         Event::TrackingStarted { dev, rms } => json!({"type":"tracking","serial":serial(*dev),"state":"started","rms":rms}),
         Event::TrackingLost { dev, reason } => json!({"type":"tracking","serial":serial(*dev),"state":"lost","reason":format!("{:?}",reason)}),
+        Event::StationDropped { id, why } => json!({"type":"station_dropped","id":id,"why":format!("{:?}",why)}),
         Event::Pose { dev, time, world_from_head, velocity, cov, used, gated, .. } => {
             let (p, q) = pose_json(world_from_head);
             json!({"type":"pose","serial":serial(*dev),"t":*time as f64 / 48e6,"p":p,"q":q,

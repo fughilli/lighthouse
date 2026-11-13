@@ -14,6 +14,16 @@
 //! the calibration is dropped and solved again from scratch (once: one solved
 //! here is refined by more scenes instead).
 //!
+//! Stations come and go: one whose light no tracker has seen for
+//! [`KernelConfig::station_expire`] while trackers do see light is dropped
+//! ([`Event::StationDropped`]), its pose and its observations in the scenes with it, so
+//! a station switched off or taken away stops counting (and is solved afresh if it comes
+//! back). A station that is tilted in place says so itself: its OOTX gravity vector moves.
+//! Past [`KernelConfig::station_tilt`] its orientation is levelled again at once (the
+//! smallest rotation that puts its new gravity where its old one was in the world; position
+//! and heading kept), its old observations dropped, and the scenes that follow refine it
+//! (a `Calibrated` with reason [`CalibrationReason::StationTilted`] reports the new pose).
+//!
 //! World frame: z up (gravity, from the trackers' accelerometers and the
 //! stations' OOTX accel vectors). Without a prior, the first calibration sets
 //! the origin at the tracker's IMU in its first still scene and the x axis
@@ -51,6 +61,9 @@ pub enum Input {
     StationPrior { id: u32, world_from_station: Pose, cov: Mat, cal: Option<[AxisCal; 2]> },
     /// Solve the station calibration again from the scenes collected.
     Recalibrate,
+    /// Forget a station: its pose, prior and observations (a host that owns the stations,
+    /// lhd for the P4, stopped naming it). Reported as [`Event::StationDropped`].
+    ForgetStation { id: u32 },
     /// The host's word that the device's clock has passed `time` (ticks, wrapping) and
     /// every pulse before it was pushed: a host that maps its clock to the device's sends
     /// this between reports, and a sweep then goes out as soon as the laser has passed
@@ -99,6 +112,9 @@ pub enum Event {
     StationsDisagree { dev: DeviceId, pos: Real, rot: Real, count: u32 },
     TrackingStarted { dev: DeviceId, rms: Real },
     TrackingLost { dev: DeviceId, reason: TrackLoss },
+    /// A station was dropped: its pose, prior and scene observations are gone. Light from
+    /// it again names it anew, and the next calibration solves it from fresh scenes.
+    StationDropped { id: u32, why: StationDrop },
     /// The device's pose ("head" frame) in the world. `cov` is 6x6 over
     /// (position, rotation), both in world axes; `time` device ticks
     /// (unwrapped); `light` the device time of the newest hit in it (the pose is
@@ -128,6 +144,17 @@ pub enum CalibrationReason {
     Requested,
     /// The stations disagreed: the old calibration was dropped.
     StationsMoved,
+    /// A station's OOTX gravity vector moved: its orientation was levelled again from it
+    /// (no fit; the stations' poses as they now are).
+    StationTilted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StationDrop {
+    /// No tracker saw its light for `station_expire` while they saw light.
+    NotSeen,
+    /// [`Input::ForgetStation`].
+    Forgotten,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +239,16 @@ pub struct KernelConfig {
     pub start_interval: Real,
     /// Added to IMU sample times (s): IMU vs light latency.
     pub imu_time_offset: Real,
+    /// A station no present tracker has seen light from for this long (s), while one of
+    /// them has seen light for that long, is dropped (Event::StationDropped). 0: never.
+    pub station_expire: Real,
+    /// Stations count as seen by a tracker, for its angle-bias states (which need two),
+    /// while their light reached it within this long (s).
+    pub station_active: Real,
+    /// A station's OOTX gravity vector moving by more than this (rad) since its pose was
+    /// set means it was tilted: its orientation is levelled again (CalibrationReason::
+    /// StationTilted). The vector is 8 bits per axis, ~0.5 degrees per count.
+    pub station_tilt: Real,
 }
 
 impl Default for KernelConfig {
@@ -247,6 +284,9 @@ impl Default for KernelConfig {
             check_stations: true,
             start_interval: 0.0,
             imu_time_offset: 0.0,
+            station_expire: 60.0,
+            station_active: 2.0,
+            station_tilt: (2.0 as Real).to_radians(),
         }
     }
 }
@@ -282,6 +322,9 @@ struct StationEntry {
     cal: Option<[AxisCal; 2]>,
     model: Option<StationModel>,
     cov: Option<Mat>,
+    /// Gravity in the station frame (its OOTX accel vector, normalised) when `model` was
+    /// set; None until both are known. Tilt is judged against it.
+    model_up: Option<Vec3>,
 }
 
 #[derive(Default)]
@@ -388,6 +431,11 @@ struct Device {
     innovations: Vec<((u32, u8), Real, Real, u32)>,
     /// Station id → index of its angle-bias states in the tracker filter.
     bias_slots: Vec<u32>,
+    /// Per station, the newest sweep's time (ticks, unwrapped); and the first sweep's.
+    station_light: Vec<(u32, i64)>,
+    first_light: Option<i64>,
+    /// IMU time of the last expiry check.
+    last_expiry_check: i64,
 }
 
 pub struct Kernel {
@@ -450,6 +498,9 @@ impl Kernel {
                     window: UpdateStats::default(),
                     innovations: Vec::new(),
                     bias_slots: Vec::new(),
+                    station_light: Vec::new(),
+                    first_light: None,
+                    last_expiry_check: 0,
                 });
                 out.push(Event::DeviceAdded { dev });
             }
@@ -482,6 +533,7 @@ impl Kernel {
                 }
                 let cal = st.cal.unwrap_or([AxisCal::default(); 2]);
                 st.model = Some(StationModel { cal, world_from_station });
+                st.model_up = st.info.as_ref().map(info_up);
                 // Prior strength from the saved covariance, floored: a saved
                 // calibration is trusted to ~mm / ~mrad at best, and its gauge
                 // directions (zero variance) aren't certainty.
@@ -496,6 +548,7 @@ impl Kernel {
                 }
             }
             Input::Recalibrate => self.calibrate(CalibrationReason::Requested, out),
+            Input::ForgetStation { id } => self.drop_station(id, StationDrop::Forgotten, out),
         }
     }
 
@@ -529,7 +582,7 @@ impl Kernel {
         match self.stations.iter().position(|s| s.id == id) {
             Some(i) => i,
             None => {
-                self.stations.push(StationEntry { id, prior: None, info: None, cal: None, model: None, cov: None });
+                self.stations.push(StationEntry { id, prior: None, info: None, cal: None, model: None, cov: None, model_up: None });
                 self.stations.len() - 1
             }
         }
@@ -542,6 +595,11 @@ impl Kernel {
         let Some(di) = self.devices.iter().position(|d| d.id == dev) else { return };
         let d = &mut self.devices[di];
         let t = d.clock.unwrap(time) + (cfg.imu_time_offset * TPS) as i64;
+        if cfg.station_expire > 0.0 && t - d.last_expiry_check >= TPS as i64 {
+            d.last_expiry_check = t;
+            self.expire_stations(out);
+        }
+        let d = &mut self.devices[di];
         d.imu.push_back((t, accel_g, gyro));
         d.last_imu = Some((t, accel_g, gyro));
         while d.imu.len() > 2000 {
@@ -777,10 +835,12 @@ impl Kernel {
                 if let Some(m) = st.model.as_mut() {
                     m.cal = info.cal;
                 }
+                let up = info_up(&info);
                 st.info = Some(info.clone());
                 if changed || new_info {
                     out.push(Event::StationSeen { dev, slot, info });
                 }
+                self.check_tilt(si, up, out);
             }
             TimingEvent::OotxError { .. } => {}
             TimingEvent::Sweep(s) => self.sweep(di, s, out),
@@ -802,6 +862,15 @@ impl Kernel {
             }
         }
         let Some(sid) = self.devices[di].slot_station[s.slot as usize] else { return };
+        {
+            let d = &mut self.devices[di];
+            let t = d.clock.unwrap(s.sync_time);
+            d.first_light.get_or_insert(t);
+            match d.station_light.iter_mut().find(|x| x.0 == sid) {
+                Some(x) => x.1 = x.1.max(t),
+                None => d.station_light.push((sid, t)),
+            }
+        }
         if let Some(sb) = self.devices[di].scene.as_mut() {
             sb.add(sid, s.axis, &s.hits);
         }
@@ -831,9 +900,18 @@ impl Kernel {
             return;
         }
 
-        // Angle-bias states only with two or more calibrated stations: with one,
-        // a bias can't be told apart from the tracker moving.
-        let calibrated = self.stations.iter().filter(|s| s.model.is_some()).count();
+        // Angle-bias states only with two or more calibrated stations this tracker sees:
+        // with one, a bias can't be told apart from the tracker moving. A station it
+        // doesn't see (switched off, gone, or out of its view) doesn't count.
+        let calibrated = {
+            let d = &self.devices[di];
+            let now = d.station_light.iter().map(|x| x.1).max().unwrap_or(0);
+            let window = (cfg.station_active * TPS) as i64;
+            d.station_light
+                .iter()
+                .filter(|(id, t)| now - *t <= window && self.stations.iter().any(|s| s.id == *id && s.model.is_some()))
+                .count()
+        };
         let d = &mut self.devices[di];
         let station_slot = if calibrated < 2 {
             None
@@ -1073,6 +1151,148 @@ impl Kernel {
         self.moved = true;
     }
 
+    // ------------------------------------------------------------ station lifecycle
+
+    /// Drops stations no present tracker has seen for `station_expire` while one has seen
+    /// light for that long (so a tracker in a drawer, or one just switched on, expires
+    /// nothing). Times are each tracker's own clock (sweep times).
+    fn expire_stations(&mut self, out: &mut Vec<Event>) {
+        let expire = (self.cfg.station_expire * TPS) as i64;
+        // Each tracker's clock: its newest IMU sample. A tracker "watches" while light
+        // reaches it and has for `station_expire`.
+        let now = |d: &Device| d.last_imu.map(|x| x.0);
+        let sees = |d: &Device, id: u32| match now(d) {
+            Some(n) => d.station_light.iter().any(|(sid, t)| *sid == id && n - *t < expire),
+            None => false,
+        };
+        let watching = self.devices.iter().any(|d| match (now(d), d.first_light) {
+            (Some(n), Some(first)) => n - first >= expire && d.station_light.iter().any(|x| n - x.1 < expire),
+            _ => false,
+        });
+        if !watching {
+            return;
+        }
+        let stale: Vec<u32> = self
+            .stations
+            .iter()
+            .filter(|s| s.model.is_some() || s.prior.is_some())
+            .map(|s| s.id)
+            .filter(|id| !self.devices.iter().any(|d| sees(d, *id)))
+            .collect();
+        for id in stale {
+            self.drop_station(id, StationDrop::NotSeen, out);
+        }
+    }
+
+    /// Forgets a station's pose, prior and its observations in the scenes; tracking that
+    /// used it starts again without it. With no placed station left, the world frame goes
+    /// too: the next calibration starts from scratch.
+    fn drop_station(&mut self, id: u32, why: StationDrop, out: &mut Vec<Event>) {
+        let Some(si) = self.stations.iter().position(|s| s.id == id) else { return };
+        let st = &mut self.stations[si];
+        if st.model.is_none() && st.prior.is_none() && why == StationDrop::NotSeen {
+            return;
+        }
+        st.model = None;
+        st.prior = None;
+        st.cov = None;
+        st.model_up = None;
+        for sc in &mut self.scenes {
+            sc.obs.retain(|o| o.0 != id);
+        }
+        let min = self.cfg.scene_min_sensors;
+        self.scenes.retain(|sc| sc.obs.iter().any(|o| sensors_seen(sc, o.0) >= min));
+        if self.reference == Some(id) {
+            self.reference = None;
+        }
+        if !self.stations.iter().any(|s| s.model.is_some()) {
+            self.world_fixed = false;
+            self.solved_here = false;
+            for sc in &mut self.scenes {
+                sc.pose = None;
+            }
+        }
+        for d in &mut self.devices {
+            d.station_light.retain(|x| x.0 != id);
+            let used = d.slot_station.contains(&Some(id));
+            if used && d.track.take().is_some() {
+                d.recent.clear();
+                d.coasting = false;
+                out.push(Event::TrackingLost { dev: d.id, reason: TrackLoss::StationsMoved });
+            }
+            d.recent.retain(|r| r.0 != id);
+        }
+        out.push(Event::StationDropped { id, why });
+    }
+
+    /// Station `si`'s OOTX gravity is now `up` (station frame). Past `station_tilt` from
+    /// the one its pose was set with, it was tilted: rotate its orientation by the smallest
+    /// rotation that puts `up` where the old gravity was in the world (position and heading
+    /// as they were; gravity can't tell the heading), drop its old observations, and
+    /// restart tracking that used it. Scenes to come refine it.
+    fn check_tilt(&mut self, si: usize, up: Vec3, out: &mut Vec<Event>) {
+        let st = &mut self.stations[si];
+        let Some(model) = st.model.as_mut() else { return };
+        let Some(old) = st.model_up else {
+            st.model_up = Some(up);
+            return;
+        };
+        let tilt = crate::math::atan2(old.cross(up).norm(), old.dot(up));
+        if !(tilt > self.cfg.station_tilt) {
+            return;
+        }
+        let rot = model.world_from_station.rot;
+        let fix = quat_between(rot.rotate(up), rot.rotate(old));
+        model.world_from_station.rot = fix.mul(rot).normalized();
+        st.model_up = Some(up);
+        if let Some(pr) = st.prior.as_mut() {
+            // Heading and position as before; the tilt is new, so trust the rotation less.
+            pr.pose = model.world_from_station;
+            pr.sigma_rot = pr.sigma_rot.max(0.05);
+        }
+        let id = st.id;
+        for sc in &mut self.scenes {
+            sc.obs.retain(|o| o.0 != id);
+        }
+        let min = self.cfg.scene_min_sensors;
+        self.scenes.retain(|sc| sc.obs.iter().any(|o| sensors_seen(sc, o.0) >= min));
+        for d in &mut self.devices {
+            if d.slot_station.contains(&Some(id)) && d.track.take().is_some() {
+                d.recent.clear();
+                d.coasting = false;
+                out.push(Event::TrackingLost { dev: d.id, reason: TrackLoss::StationsMoved });
+            }
+            d.recent.retain(|r| r.0 != id);
+        }
+        let stations: Vec<StationReport> = self
+            .stations
+            .iter()
+            .filter_map(|s| {
+                let m = s.model.as_ref()?;
+                Some(StationReport {
+                    id: s.id,
+                    mode: s.info.as_ref().map(|i| i.mode),
+                    world_from_station: m.world_from_station,
+                    cov: s.cov.clone().unwrap_or_else(|| Mat::zeros(6, 6)),
+                    rms: 0.0,
+                    up_error: s.model_up.map_or(0.0, |u| {
+                        let w = m.world_from_station.rot.rotate(u);
+                        crate::math::atan2(w.cross(Vec3::new(0.0, 0.0, 1.0)).norm(), w.z)
+                    }),
+                    cal: m.cal,
+                })
+            })
+            .collect();
+        out.push(Event::Calibrated {
+            reason: CalibrationReason::StationTilted,
+            stations,
+            scenes: 0,
+            dropped: 0,
+            tracker_up_error: 0.0,
+            pending: Vec::new(),
+        });
+    }
+
     fn calibrate(&mut self, reason: CalibrationReason, out: &mut Vec<Event>) {
         if let Err(why) = self.try_calibrate(reason, out) {
             if reason != CalibrationReason::MoreScenes {
@@ -1248,6 +1468,7 @@ impl Kernel {
             let st = &mut self.stations[si];
             st.model = Some(cal.stations[ki].clone());
             st.cov = Some(cal.station_cov[ki].clone());
+            st.model_up = st.info.as_ref().map(info_up);
             reports.push(StationReport {
                 id,
                 mode: st.info.as_ref().map(|i| i.mode),
@@ -1286,6 +1507,11 @@ impl Kernel {
         });
         Ok(())
     }
+}
+
+/// A station's OOTX gravity vector (station frame), normalised.
+fn info_up(i: &StationInfo) -> Vec3 {
+    Vec3::new(i.accel_dir[0] as Real, i.accel_dir[1] as Real, i.accel_dir[2] as Real).normalized()
 }
 
 /// Two scenes of one device with nearly the same angles on the sensors they
@@ -1582,5 +1808,134 @@ mod tests {
         let mut out = Vec::new();
         k.push(Input::Recalibrate, &mut out);
         assert!(matches!(out[..], [Event::CalibrationSkipped { reason: CalibrationReason::Requested, .. }]), "{:?}", out);
+    }
+
+    // ---------------------------------------------------------------- station lifecycle
+
+    /// A kernel with C and B both loaded from a saved calibration; only C is ever named
+    /// and seen (B was switched off or taken away).
+    fn sim_with_stale_b(expire: Real) -> Sim {
+        let mut sim = Sim::new(true);
+        sim.k.cfg.station_expire = expire;
+        let mut cov = Mat::zeros(6, 6);
+        for i in 0..6 {
+            cov[(i, i)] = 1e-6;
+        }
+        let b = sim.b.world_from_station;
+        sim.k.push(Input::StationPrior { id: B, world_from_station: b, cov, cal: Some(cal()) }, &mut sim.out);
+        sim
+    }
+
+    fn dropped(out: &[Event]) -> Vec<(u32, StationDrop)> {
+        out.iter()
+            .filter_map(|e| match e {
+                Event::StationDropped { id, why } => Some((*id, *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rot_angle(a: Quat, b: Quat) -> Real {
+        let d = a.conj().mul(b);
+        2.0 * crate::math::atan2(Vec3::new(d.x, d.y, d.z).norm(), crate::math::fabs(d.w))
+    }
+
+    fn model_of(k: &Kernel, id: u32) -> Option<StationModel> {
+        k.stations.iter().find(|s| s.id == id).and_then(|s| s.model.clone())
+    }
+
+    #[test]
+    fn a_calibrated_station_the_tracker_doesnt_see_adds_no_bias_states() {
+        let mut sim = sim_with_stale_b(0.0);
+        let p = table();
+        sim.hold(&p, 2.0, false);
+        let d = &sim.k.devices[0];
+        assert!(d.track.is_some(), "not tracking");
+        assert!(d.bias_slots.is_empty(), "angle-bias states with one station in view: {:?}", d.bias_slots);
+    }
+
+    #[test]
+    fn a_station_not_seen_for_a_while_is_dropped() {
+        let mut sim = sim_with_stale_b(5.0);
+        let p = table();
+        sim.hold(&p, 4.0, false);
+        assert!(dropped(&sim.out).is_empty(), "dropped too early: {:?}", dropped(&sim.out));
+        sim.hold(&p, 3.0, false);
+        assert_eq!(dropped(&sim.out), alloc::vec![(B, StationDrop::NotSeen)]);
+        assert!(model_of(&sim.k, B).is_none());
+        assert!(model_of(&sim.k, C).is_some(), "C is in view and must stay");
+        assert!(sim.k.devices[0].track.is_some(), "tracking on C goes on");
+    }
+
+    #[test]
+    fn nothing_expires_while_no_light_reaches_any_tracker() {
+        let mut sim = sim_with_stale_b(2.0);
+        // IMU only (a tracker in a drawer): no sweeps at all.
+        let up = table().rot.conj().rotate(Vec3::new(0.0, 0.0, 1.0));
+        for _ in 0..(10 * 250) {
+            sim.t = sim.t.wrapping_add(DT);
+            sim.k.push(Input::Imu { dev: 0, time: sim.t, accel_g: up, gyro: Vec3::ZERO }, &mut sim.out);
+        }
+        assert!(dropped(&sim.out).is_empty(), "{:?}", dropped(&sim.out));
+        assert!(model_of(&sim.k, B).is_some() && model_of(&sim.k, C).is_some());
+    }
+
+    #[test]
+    fn a_tilted_station_is_levelled_again_from_its_gravity() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.scene(&p);
+        assert!(sim.k.devices[0].track.is_some());
+        // C is knocked: 6 degrees about a horizontal axis, in place.
+        let before = model_of(&sim.k, C).unwrap().world_from_station;
+        let knock = Quat::from_rotvec(Vec3::new(0.7, -0.7, 0.0).normalized().scale((6.0 as Real).to_radians()));
+        let mut tilted = sim.c.clone();
+        tilted.world_from_station.rot = knock.mul(sim.c.world_from_station.rot).normalized();
+        let di = 0;
+        let inf = info(C, 2, &tilted);
+        sim.k.timing_event(di, TimingEvent::Station { slot: 0, info: inf }, &mut sim.out);
+        let after = model_of(&sim.k, C).unwrap().world_from_station;
+        assert!(after.pos.sub(before.pos).norm() < 1e-9, "position kept");
+        let err = rot_angle(after.rot, tilted.world_from_station.rot).to_degrees();
+        assert!(err < 1.5, "levelled orientation {:.2} deg off the tilted station", err);
+        let was = rot_angle(before.rot, tilted.world_from_station.rot).to_degrees();
+        assert!(was > 5.0, "{:.2}", was);
+        assert!(
+            sim.out.iter().any(|e| matches!(e, Event::Calibrated { reason: CalibrationReason::StationTilted, .. })),
+            "no StationTilted report"
+        );
+        // Tracking restarts on the levelled station.
+        sim.c = tilted;
+        let n = sim.out.len();
+        sim.hold(&p, 2.0, false);
+        assert!(sim.out[n..].iter().any(|e| matches!(e, Event::TrackingStarted { .. })), "tracking didn't restart");
+        assert!(sim.k.devices[0].track.is_some());
+    }
+
+    #[test]
+    fn gravity_jitter_of_a_count_is_not_a_tilt() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.scene(&p);
+        let before = model_of(&sim.k, C).unwrap().world_from_station;
+        let mut inf = info(C, 2, &sim.c);
+        inf.accel_dir[0] = inf.accel_dir[0].saturating_add(1);
+        sim.k.timing_event(0, TimingEvent::Station { slot: 0, info: inf }, &mut sim.out);
+        assert_eq!(model_of(&sim.k, C).unwrap().world_from_station.rot, before.rot);
+        assert!(!sim.out.iter().any(|e| matches!(e, Event::Calibrated { reason: CalibrationReason::StationTilted, .. })));
+    }
+
+    #[test]
+    fn forget_station_drops_it_and_its_observations() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.name_b();
+        sim.scene(&p);
+        assert!(model_of(&sim.k, B).is_some(), "B placed");
+        sim.k.push(Input::ForgetStation { id: B }, &mut sim.out);
+        assert_eq!(dropped(&sim.out), alloc::vec![(B, StationDrop::Forgotten)]);
+        assert!(model_of(&sim.k, B).is_none());
+        assert!(sim.k.scenes.iter().all(|sc| sc.obs.iter().all(|o| o.0 != B)));
+        assert!(model_of(&sim.k, C).is_some());
     }
 }
