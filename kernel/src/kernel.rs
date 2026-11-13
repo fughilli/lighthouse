@@ -64,6 +64,10 @@ pub enum Input {
     /// Forget a station: its pose, prior and observations (a host that owns the stations,
     /// lhd for the P4, stopped naming it). Reported as [`Event::StationDropped`].
     ForgetStation { id: u32 },
+    /// Restart a device's tracking (its pose solve), keeping its sweep-timing lock and which
+    /// station is in which slot: the stations' world changed under it (a host adopted new
+    /// station poses). Unlike DeviceRemoved + DeviceAdded, nothing waits for OOTX again.
+    ResetTrack { dev: DeviceId },
     /// The host's word that the device's clock has passed `time` (ticks, wrapping) and
     /// every pulse before it was pushed: a host that maps its clock to the device's sends
     /// this between reports, and a sweep then goes out as soon as the laser has passed
@@ -147,6 +151,9 @@ pub enum CalibrationReason {
     /// A station's OOTX gravity vector moved: its orientation was levelled again from it
     /// (no fit; the stations' poses as they now are).
     StationTilted,
+    /// A station moved while a tracker sat still (the tracker's optical pose drifted with
+    /// its IMU still): solved again from that tracker's view once it settled.
+    StationRelocated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,8 +254,25 @@ pub struct KernelConfig {
     pub station_active: Real,
     /// A station's OOTX gravity vector moving by more than this (rad) since its pose was
     /// set means it was tilted: its orientation is levelled again (CalibrationReason::
-    /// StationTilted). The vector is 8 bits per axis, ~0.5 degrees per count.
+    /// StationTilted). The vector is 8 bits per axis, ~0.5 degrees per count, and a still
+    /// station's reading wanders by ~1 degree: a tilt must show in two packets in a row,
+    /// agreeing within half of this.
     pub station_tilt: Real,
+    /// A tracker still (IMU) and tracking on one station keeps a reference pose once its
+    /// position sigma is under `still_ref_sigma` (m). If the optical pose then drifts past
+    /// `relocate_pos` (m) or `relocate_rot` (rad) from it, the station moved, not the tracker:
+    /// the tracker is held at the reference, the station's hits stop feeding the filter, and
+    /// the station is solved again from them every `relocate_window` (s) until two solves in a
+    /// row agree within `relocate_agree_pos` / `relocate_agree_rot` (it settled), then
+    /// adopted (Calibrated, StationRelocated). Gives up after `relocate_timeout` (s), or as
+    /// soon as the tracker moves.
+    pub still_ref_sigma: Real,
+    pub relocate_pos: Real,
+    pub relocate_rot: Real,
+    pub relocate_window: Real,
+    pub relocate_agree_pos: Real,
+    pub relocate_agree_rot: Real,
+    pub relocate_timeout: Real,
 }
 
 impl Default for KernelConfig {
@@ -286,7 +310,14 @@ impl Default for KernelConfig {
             imu_time_offset: 0.0,
             station_expire: 60.0,
             station_active: 2.0,
-            station_tilt: (2.0 as Real).to_radians(),
+            station_tilt: (3.0 as Real).to_radians(),
+            still_ref_sigma: 0.008,
+            relocate_pos: 0.03,
+            relocate_rot: (2.0 as Real).to_radians(),
+            relocate_window: 0.6,
+            relocate_agree_pos: 0.01,
+            relocate_agree_rot: (0.3 as Real).to_radians(),
+            relocate_timeout: 30.0,
         }
     }
 }
@@ -325,6 +356,8 @@ struct StationEntry {
     /// Gravity in the station frame (its OOTX accel vector, normalised) when `model` was
     /// set; None until both are known. Tilt is judged against it.
     model_up: Option<Vec3>,
+    /// A first OOTX reading past the tilt threshold, waiting for the next to confirm it.
+    tilt_pending: Option<Vec3>,
 }
 
 #[derive(Default)]
@@ -436,6 +469,20 @@ struct Device {
     first_light: Option<i64>,
     /// IMU time of the last expiry check.
     last_expiry_check: i64,
+    /// Still and tracking: the pose to hold it to, and its position sigma then.
+    still_ref: Option<(Pose, Real)>,
+    /// A station moving under this still tracker (see KernelConfig::relocate_*).
+    relocating: Option<Relocating>,
+}
+
+struct Relocating {
+    station: u32,
+    held: Pose,
+    since: i64,
+    window_start: i64,
+    sb: SceneBuilder,
+    last: Option<StationModel>,
+    hits: u32,
 }
 
 pub struct Kernel {
@@ -501,6 +548,8 @@ impl Kernel {
                     station_light: Vec::new(),
                     first_light: None,
                     last_expiry_check: 0,
+                    still_ref: None,
+                    relocating: None,
                 });
                 out.push(Event::DeviceAdded { dev });
             }
@@ -549,6 +598,17 @@ impl Kernel {
             }
             Input::Recalibrate => self.calibrate(CalibrationReason::Requested, out),
             Input::ForgetStation { id } => self.drop_station(id, StationDrop::Forgotten, out),
+            Input::ResetTrack { dev } => {
+                let Some(d) = self.devices.iter_mut().find(|d| d.id == dev) else { return };
+                d.still_ref = None;
+                d.relocating = None;
+                d.coasting = false;
+                d.recent.clear();
+                d.bias_slots.clear();
+                if d.track.take().is_some() {
+                    out.push(Event::TrackingLost { dev, reason: TrackLoss::StationsMoved });
+                }
+            }
         }
     }
 
@@ -582,7 +642,7 @@ impl Kernel {
         match self.stations.iter().position(|s| s.id == id) {
             Some(i) => i,
             None => {
-                self.stations.push(StationEntry { id, prior: None, info: None, cal: None, model: None, cov: None, model_up: None });
+                self.stations.push(StationEntry { id, prior: None, info: None, cal: None, model: None, cov: None, model_up: None, tilt_pending: None });
                 self.stations.len() - 1
             }
         }
@@ -626,6 +686,16 @@ impl Kernel {
             d.still.since = t;
             out.push(Event::Still { dev, still });
             if !still {
+                // The tracker moves: no reference to hold it to; a station still relocating
+                // can't be told apart from the motion now.
+                let d = &mut self.devices[di];
+                d.still_ref = None;
+                if d.relocating.take().is_some() {
+                    d.recent.clear();
+                    if d.track.take().is_some() {
+                        out.push(Event::TrackingLost { dev, reason: TrackLoss::StationsMoved });
+                    }
+                }
                 self.finish_scene(di, out);
                 return;
             }
@@ -697,6 +767,17 @@ impl Kernel {
                 sb.acc_n += 1;
             }
             let dur = (t - d.still.since) as Real / TPS;
+            // The pose to hold a still tracker to (relocation): once settled, and again
+            // whenever it has become much more certain.
+            if dur >= 0.3 && d.relocating.is_none() {
+                if let Some(track) = d.track.as_ref() {
+                    let sp = sigmas(track).0;
+                    let take = sp < cfg.still_ref_sigma && d.still_ref.map_or(true, |(_, r)| sp < r * 0.5);
+                    if take {
+                        d.still_ref = Some((track.pose(), sp));
+                    }
+                }
+            }
             if d.scene.is_none() && dur >= 0.3 {
                 d.scene = Some(SceneBuilder { start: t, clusters: Vec::new(), acc_sum: Vec3::ZERO, acc_n: 0 });
             }
@@ -716,15 +797,7 @@ impl Kernel {
         if dur < self.cfg.scene_min || sb.acc_n == 0 {
             return;
         }
-        let mut obs = Vec::new();
-        for ((st, axis, sensor), cl) in &sb.clusters {
-            let top = cl.iter().map(|c| c.values.len()).max().unwrap_or(0);
-            let mut ranked: Vec<&Cluster> = cl.iter().filter(|c| c.values.len() >= 8 && c.values.len() * 3 >= top).collect();
-            ranked.sort_by(|a, b| b.values.len().cmp(&a.values.len()));
-            for c in ranked {
-                obs.push((*st, *axis, *sensor, c.median(), c.values.len()));
-            }
-        }
+        let obs = scene_obs(&sb, 8);
         let up = sb.acc_sum.scale(1.0 / sb.acc_n as Real);
         let pose = d.track.as_ref().map(|t| t.pose());
         let mut rec = SceneRecord { dev: d.id, up_body: up.normalized(), obs, pose };
@@ -850,14 +923,19 @@ impl Kernel {
     fn sweep(&mut self, di: usize, s: Sweep, out: &mut Vec<Event>) {
         {
             let d = &mut self.devices[di];
-            if d.relock_slots != 3 && d.slot_station.contains(&None) && d.prev_slot_station != [None, None] {
+            // Back once sweeps came from every slot that had a station: both with two (which
+            // pins the cycle phase), slot 0 alone with a lone station (it never has a slave;
+            // waiting for a second slot left it to the next OOTX packet, ~6 s).
+            let need = (d.prev_slot_station[0].is_some() as u8) | ((d.prev_slot_station[1].is_some() as u8) << 1);
+            if d.relock_slots != 3 && d.slot_station.contains(&None) && need != 0 {
                 d.relock_slots |= 1 << (s.slot & 1);
-                if d.relock_slots == 3 {
+                if d.relock_slots & need == need {
                     for slot in 0..2 {
                         if d.slot_station[slot].is_none() {
                             d.slot_station[slot] = d.prev_slot_station[slot];
                         }
                     }
+                    d.relock_slots = 3;
                 }
             }
         }
@@ -875,6 +953,10 @@ impl Kernel {
             sb.add(sid, s.axis, &s.hits);
         }
         let Some(si) = self.stations.iter().position(|x| x.id == sid) else { return };
+        if self.devices[di].track.is_some() && self.devices[di].relocating.as_ref().map_or(false, |r| r.station == sid) {
+            self.relocate_sweep(di, si, &s, out);
+            return;
+        }
         let Some(station) = self.stations[si].model.clone() else { return };
         let station_cov = self.stations[si].cov.clone();
         let cfg = self.cfg;
@@ -1006,27 +1088,150 @@ impl Kernel {
             out.push(Event::TrackingLost { dev: d.id, reason });
             return;
         }
-        // Publish at the newest IMU time (a propagated copy; the filter stays
-        // at the light).
-        let mut pubst = track.clone();
-        if let Some(last) = d.last_imu {
-            let mut q: VecDeque<(i64, Vec3, Vec3)> = d.imu.iter().copied().filter(|x| x.0 > pubst.time).collect();
-            advance(&mut pubst, &mut q, last.0, d.last_imu, &cfg.track);
+        // Still, on one station, and the optical pose walked away from where the tracker
+        // settled: the IMU says it didn't move, so the station did (KernelConfig::relocate_*).
+        // Hold the tracker there and solve the station again once it settles.
+        if calibrated == 1 && d.relocating.is_none() {
+            if let Some((held, ref_sigma)) = d.still_ref {
+                let p = track.pose();
+                let dpos = p.pos.sub(held.pos).norm();
+                let drot = rot_between(p.rot, held.rot);
+                if dpos > cfg.relocate_pos.max(4.0 * ref_sigma) || drot > cfg.relocate_rot {
+                    let track = d.track.as_mut().unwrap();
+                    track.pos = held.pos;
+                    track.rot = held.rot;
+                    track.vel = Vec3::ZERO;
+                    d.relocating = Some(Relocating {
+                        station: sid,
+                        held,
+                        since: now,
+                        window_start: now,
+                        sb: new_scene(now),
+                        last: None,
+                        hits: 0,
+                    });
+                }
+            }
         }
-        let (pose, cov) = head_pose(&pubst, &d.model.body_from_head);
-        out.push(Event::Pose {
-            dev: d.id,
-            time: pubst.time,
-            light: now,
-            world_from_head: pose,
-            world_from_body: pubst.pose(),
-            velocity: pubst.vel,
-            cov,
-            used: d.window.used,
-            gated: d.window.gated,
-            speculative: d.coasting || dark > cfg.coast_after,
-        });
-        d.window = UpdateStats::default();
+        let speculative = d.coasting || dark > cfg.coast_after;
+        publish_pose(d, now, speculative, &cfg, out);
+    }
+
+    /// A sweep from the station moving under a still tracker (Device::relocating): its hits
+    /// go into the station's solve, not the track; the tracker is held where it settled.
+    fn relocate_sweep(&mut self, di: usize, si: usize, s: &Sweep, out: &mut Vec<Event>) {
+        let cfg = self.cfg;
+        let sid = self.stations[si].id;
+        let up = self.stations[si].info.as_ref().map(info_up);
+        let init = self.stations[si].model.clone();
+        let d = &mut self.devices[di];
+        let now = d.clock.unwrap(s.sync_time);
+        let n: u32 = s.hits.len() as u32;
+        let Some(r) = d.relocating.as_mut() else { return };
+        r.sb.add(sid, s.axis, &s.hits);
+        r.hits += n;
+        let held = r.held;
+        // The tracker is still: keep it where it settled (the IMU's zero-velocity updates
+        // hold the rest).
+        if let Some(track) = d.track.as_mut() {
+            if now > track.time {
+                advance(track, &mut d.imu, now, d.last_imu, &cfg.track);
+            }
+            track.pos = held.pos;
+            track.rot = held.rot;
+            track.vel = Vec3::ZERO;
+        }
+        d.last_used = now;
+        d.gated_run = 0;
+        d.coasting = false;
+        // The light is in use (solving the station), so the pose isn't dark.
+        d.window.used += n;
+        let r = d.relocating.as_mut().unwrap();
+        if (now - r.since) as Real > cfg.relocate_timeout * TPS {
+            d.relocating = None;
+            d.still_ref = None;
+            d.recent.clear();
+            if d.track.take().is_some() {
+                out.push(Event::TrackingLost { dev: d.id, reason: TrackLoss::StationsMoved });
+            }
+            return;
+        }
+        let mut settled: Option<StationModel> = None;
+        if (now - r.window_start) as Real >= cfg.relocate_window * TPS {
+            let mut obs: Vec<Obs> = Vec::new();
+            for o in scene_obs(&r.sb, 4).iter().filter(|o| o.0 == sid) {
+                if !obs.iter().any(|x| x.axis == o.1 && x.sensor == o.2 as u16) {
+                    obs.push(Obs { station: 0, axis: o.1, sensor: o.2 as u16, angle: o.3 });
+                }
+            }
+            let mut seen = 0u64;
+            for o in &obs {
+                seen |= 1 << (o.sensor & 63);
+            }
+            let solved = match (&init, seen.count_ones() as usize >= cfg.scene_min_sensors) {
+                (Some(init), true) => crate::solve::relocate_station(&d.model, init, &held, &obs, up, &cfg.solve),
+                _ => None,
+            };
+            match solved {
+                Some((st, rms)) if rms < 2e-3 => {
+                    let agree = r.last.as_ref().map_or(false, |p| {
+                        p.world_from_station.pos.sub(st.world_from_station.pos).norm() < cfg.relocate_agree_pos
+                            && rot_between(p.world_from_station.rot, st.world_from_station.rot) < cfg.relocate_agree_rot
+                    });
+                    if agree {
+                        settled = Some(st);
+                    } else {
+                        r.last = Some(st);
+                    }
+                }
+                _ => r.last = None,
+            }
+            r.sb = new_scene(now);
+            r.window_start = now;
+        }
+        if let Some(st_model) = settled {
+            let sigma = d.track.as_ref().map_or(0.0, |t| sigmas(t).0);
+            d.relocating = None;
+            d.still_ref = Some((held, sigma.max(1e-4)));
+            let entry = &mut self.stations[si];
+            entry.model = Some(st_model.clone());
+            entry.prior = None;
+            entry.model_up = entry.info.as_ref().map(info_up);
+            entry.tilt_pending = None;
+            // Every placed station, as a calibration reports them (lhd saves the report: one
+            // station alone would drop the others from its file).
+            let reports: Vec<StationReport> = self
+                .stations
+                .iter()
+                .filter_map(|e| {
+                    let m = e.model.as_ref()?;
+                    Some(StationReport {
+                        id: e.id,
+                        mode: e.info.as_ref().map(|i| i.mode),
+                        world_from_station: m.world_from_station,
+                        cov: e.cov.clone().unwrap_or_else(|| Mat::zeros(6, 6)),
+                        rms: 0.0,
+                        up_error: 0.0,
+                        cal: m.cal,
+                    })
+                })
+                .collect();
+            for sc in &mut self.scenes {
+                sc.obs.retain(|o| o.0 != sid);
+            }
+            let min = cfg.scene_min_sensors;
+            self.scenes.retain(|sc| sc.obs.iter().any(|o| sensors_seen(sc, o.0) >= min));
+            out.push(Event::Calibrated {
+                reason: CalibrationReason::StationRelocated,
+                stations: reports,
+                scenes: 0,
+                dropped: 0,
+                tracker_up_error: 0.0,
+                pending: Vec::new(),
+            });
+        }
+        let d = &mut self.devices[di];
+        publish_pose(d, now, false, &cfg, out);
     }
 
     fn try_start_tracking(&mut self, di: usize, out: &mut Vec<Event>) {
@@ -1231,16 +1436,30 @@ impl Kernel {
     /// as they were; gravity can't tell the heading), drop its old observations, and
     /// restart tracking that used it. Scenes to come refine it.
     fn check_tilt(&mut self, si: usize, up: Vec3, out: &mut Vec<Event>) {
+        let thr = self.cfg.station_tilt;
         let st = &mut self.stations[si];
-        let Some(model) = st.model.as_mut() else { return };
+        if st.model.is_none() {
+            return;
+        }
         let Some(old) = st.model_up else {
             st.model_up = Some(up);
             return;
         };
-        let tilt = crate::math::atan2(old.cross(up).norm(), old.dot(up));
-        if !(tilt > self.cfg.station_tilt) {
+        let angle = |a: Vec3, b: Vec3| crate::math::atan2(a.cross(b).norm(), a.dot(b));
+        if !(angle(old, up) > thr) {
+            st.tilt_pending = None;
             return;
         }
+        // One packet past the threshold could be the accelerometer's wander (~1 degree) or a
+        // bump; a tilt is the same new reading twice.
+        match st.tilt_pending {
+            Some(p) if angle(p, up) <= thr / 2.0 => st.tilt_pending = None,
+            _ => {
+                st.tilt_pending = Some(up);
+                return;
+            }
+        }
+        let model = st.model.as_mut().unwrap();
         let rot = model.world_from_station.rot;
         let fix = quat_between(rot.rotate(up), rot.rotate(old));
         model.world_from_station.rot = fix.mul(rot).normalized();
@@ -1509,6 +1728,55 @@ impl Kernel {
     }
 }
 
+/// A scene's observations: per (station, axis, sensor), its clusters of hit angles with at
+/// least `min` hits and a third of the most-hit one, most-hit first, as their medians.
+fn scene_obs(sb: &SceneBuilder, min: usize) -> Vec<(u32, u8, u8, Real, usize)> {
+    let mut obs = Vec::new();
+    for ((st, axis, sensor), cl) in &sb.clusters {
+        let top = cl.iter().map(|c| c.values.len()).max().unwrap_or(0);
+        let mut ranked: Vec<&Cluster> = cl.iter().filter(|c| c.values.len() >= min && c.values.len() * 3 >= top).collect();
+        ranked.sort_by(|a, b| b.values.len().cmp(&a.values.len()));
+        for c in ranked {
+            obs.push((*st, *axis, *sensor, c.median(), c.values.len()));
+        }
+    }
+    obs
+}
+
+fn new_scene(t: i64) -> SceneBuilder {
+    SceneBuilder { start: t, clusters: Vec::new(), acc_sum: Vec3::ZERO, acc_n: 0 }
+}
+
+fn rot_between(a: Quat, b: Quat) -> Real {
+    let d = a.conj().mul(b);
+    2.0 * crate::math::atan2(Vec3::new(d.x, d.y, d.z).norm(), crate::math::fabs(d.w))
+}
+
+/// Publishes the device's pose at the newest IMU time (a propagated copy; the filter stays at
+/// the light), with `light` the newest hit's time, and starts a new stats window.
+fn publish_pose(d: &mut Device, light: i64, speculative: bool, cfg: &KernelConfig, out: &mut Vec<Event>) {
+    let Some(track) = d.track.as_ref() else { return };
+    let mut pubst = track.clone();
+    if let Some(last) = d.last_imu {
+        let mut q: VecDeque<(i64, Vec3, Vec3)> = d.imu.iter().copied().filter(|x| x.0 > pubst.time).collect();
+        advance(&mut pubst, &mut q, last.0, d.last_imu, &cfg.track);
+    }
+    let (pose, cov) = head_pose(&pubst, &d.model.body_from_head);
+    out.push(Event::Pose {
+        dev: d.id,
+        time: pubst.time,
+        light,
+        world_from_head: pose,
+        world_from_body: pubst.pose(),
+        velocity: pubst.vel,
+        cov,
+        used: d.window.used,
+        gated: d.window.gated,
+        speculative,
+    });
+    d.window = UpdateStats::default();
+}
+
 /// A station's OOTX gravity vector (station frame), normalised.
 fn info_up(i: &StationInfo) -> Vec3 {
     Vec3::new(i.accel_dir[0] as Real, i.accel_dir[1] as Real, i.accel_dir[2] as Real).normalized()
@@ -1661,6 +1929,8 @@ mod tests {
         model: TrackerModel,
         c: StationModel,
         b: StationModel,
+        /// B sweeps its slot (named or not); off: C alone, as a lone station.
+        b_on: bool,
     }
 
     impl Sim {
@@ -1675,6 +1945,7 @@ mod tests {
                 model: tracker(),
                 c: station(Vec3::new(2.0, -1.0, 2.0)),
                 b: station(Vec3::new(-1.5, 2.0, 2.2)),
+                b_on: true,
             };
             let mut cov = Mat::zeros(6, 6);
             for i in 0..6 {
@@ -1713,6 +1984,9 @@ mod tests {
                 self.k.push(Input::Imu { dev: self.dev, time: self.t, accel_g: up.scale(jitter), gyro: Vec3::ZERO }, &mut self.out);
                 let di = self.k.devices.iter().position(|d| d.id == self.dev).unwrap();
                 for (slot, st) in [(0u8, self.c.clone()), (1u8, self.b.clone())] {
+                    if slot == 1 && !self.b_on {
+                        continue;
+                    }
                     for axis in 0..2u8 {
                         let mut hits = Vec::new();
                         for (s, p) in self.model.sensors.iter().enumerate() {
@@ -1893,6 +2167,9 @@ mod tests {
         tilted.world_from_station.rot = knock.mul(sim.c.world_from_station.rot).normalized();
         let di = 0;
         let inf = info(C, 2, &tilted);
+        // One packet isn't a tilt yet (the accelerometer wanders); the same reading again is.
+        sim.k.timing_event(di, TimingEvent::Station { slot: 0, info: inf.clone() }, &mut sim.out);
+        assert_eq!(model_of(&sim.k, C).unwrap().world_from_station.rot, before.rot, "levelled on one packet");
         sim.k.timing_event(di, TimingEvent::Station { slot: 0, info: inf }, &mut sim.out);
         let after = model_of(&sim.k, C).unwrap().world_from_station;
         assert!(after.pos.sub(before.pos).norm() < 1e-9, "position kept");
@@ -1923,6 +2200,114 @@ mod tests {
         sim.k.timing_event(0, TimingEvent::Station { slot: 0, info: inf }, &mut sim.out);
         assert_eq!(model_of(&sim.k, C).unwrap().world_from_station.rot, before.rot);
         assert!(!sim.out.iter().any(|e| matches!(e, Event::Calibrated { reason: CalibrationReason::StationTilted, .. })));
+    }
+
+    /// The poses published for the tracker since output index `from`: (body position error
+    /// against `truth`, m).
+    fn pose_errors(out: &[Event], from: usize, truth: &Pose) -> Vec<Real> {
+        out[from..]
+            .iter()
+            .filter_map(|e| match e {
+                Event::Pose { world_from_body, .. } => Some(world_from_body.pos.sub(truth.pos).norm()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn relocated(out: &[Event]) -> Option<StationReport> {
+        out.iter().rev().find_map(|e| match e {
+            Event::Calibrated { reason: CalibrationReason::StationRelocated, stations, .. } => {
+                stations.iter().find(|s| s.id == C).cloned()
+            }
+            _ => None,
+        })
+    }
+
+    fn lost(out: &[Event], from: usize) -> Vec<TrackLoss> {
+        out[from..]
+            .iter()
+            .filter_map(|e| match e {
+                Event::TrackingLost { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Moves station C by `turn` (about world z, through its own position) and `shift`, in
+    /// `steps` over `secs` while the tracker sits still at `p`.
+    fn move_c(sim: &mut Sim, p: &Pose, turn: Real, shift: Vec3, secs: Real, steps: u32) {
+        let start = sim.c.world_from_station;
+        for i in 1..=steps {
+            let f = i as Real / steps as Real;
+            let rot = Quat::from_rotvec(Vec3::new(0.0, 0.0, turn * f)).mul(start.rot).normalized();
+            sim.c.world_from_station = Pose { pos: start.pos.add(shift.scale(f)), rot };
+            sim.hold(p, secs / steps as Real, false);
+        }
+    }
+
+    #[test]
+    fn a_station_moved_under_a_still_tracker_is_solved_again_not_the_tracker() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.hold(&p, 3.0, false);
+        assert!(sim.k.devices[0].track.is_some() && sim.k.devices[0].still_ref.is_some(), "settled on the table");
+        let n = sim.out.len();
+        move_c(&mut sim, &p, (5.0 as Real).to_radians(), Vec3::new(0.1, 0.0, 0.0), 1.0, 20);
+        sim.hold(&p, 4.0, false);
+        let rep = relocated(&sim.out[n..]).expect("the station wasn't solved again");
+        let truth = sim.c.world_from_station;
+        let dpos = rep.world_from_station.pos.sub(truth.pos).norm();
+        let drot = rot_between(rep.world_from_station.rot, truth.rot).to_degrees();
+        assert!(dpos < 0.02 && drot < 0.5, "relocated {:.1} mm / {:.2} deg off", dpos * 1e3, drot);
+        assert!(lost(&sim.out, n).is_empty(), "lost: {:?}", lost(&sim.out, n));
+        // The tracker stays put: no further off than the detection threshold, ever.
+        let errs = pose_errors(&sim.out, n, &p);
+        let worst = errs.iter().cloned().fold(0.0, Real::max);
+        assert!(worst < sim.k.cfg.relocate_pos + 0.01, "the tracker jumped {:.1} mm", worst * 1e3);
+        // And tracking goes on with the new station: still right after.
+        let m = sim.out.len();
+        sim.hold(&p, 1.0, false);
+        let after = pose_errors(&sim.out, m, &p);
+        assert!(!after.is_empty() && after.iter().all(|e| *e < 0.01), "after: {:?}", &after[..after.len().min(5)]);
+    }
+
+    #[test]
+    fn a_still_station_under_a_still_tracker_is_never_relocated() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.hold(&p, 20.0, false);
+        assert!(relocated(&sim.out).is_none());
+        assert!(sim.k.devices[0].relocating.is_none());
+        assert!(lost(&sim.out, 0).is_empty());
+    }
+
+    #[test]
+    fn a_tracker_that_moves_while_its_station_relocates_is_lost_not_misplaced() {
+        let mut sim = Sim::new(true);
+        let p = table();
+        sim.hold(&p, 3.0, false);
+        let n = sim.out.len();
+        move_c(&mut sim, &p, (5.0 as Real).to_radians(), Vec3::ZERO, 0.6, 12);
+        assert!(sim.k.devices[0].relocating.is_some(), "relocation didn't start");
+        sim.hold(&p, 0.3, true); // picked up
+        assert!(sim.k.devices[0].relocating.is_none());
+        assert!(lost(&sim.out, n).contains(&TrackLoss::StationsMoved), "{:?}", lost(&sim.out, n));
+        assert!(relocated(&sim.out[n..]).is_none());
+    }
+
+    #[test]
+    fn a_lone_station_is_back_in_its_slot_right_after_a_relock() {
+        let mut sim = Sim::new(true);
+        sim.b_on = false; // C alone: nothing ever sweeps slot 1
+        let p = table();
+        sim.hold(&p, 2.0, false);
+        let di = 0;
+        sim.k.timing_event(di, TimingEvent::LockLost { reason: LockLoss::Silence }, &mut sim.out);
+        assert_eq!(sim.k.devices[di].slot_station, [None, None]);
+        sim.k.timing_event(di, TimingEvent::Locked { phase: 0, inliers: 8 }, &mut sim.out);
+        // A few sweeps, far short of an OOTX packet (seconds).
+        sim.hold(&p, 0.05, false);
+        assert_eq!(sim.k.devices[di].slot_station[0], Some(C), "waits for OOTX");
     }
 
     #[test]

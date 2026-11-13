@@ -394,6 +394,39 @@ pub fn bootstrap_station(
 }
 
 /// An upright station (+y up) at `pos` looking at `target` (along its -z).
+/// A station that moved, solved again from a still tracker at a known pose: refined from
+/// where it was (`init`), and from scratch (bootstrap_station) only when that doesn't fit.
+/// Returns the station and the RMS angle residual of `obs` (rad).
+pub fn relocate_station(
+    model: &TrackerModel,
+    init: &StationModel,
+    world_from_body: &Pose,
+    obs: &[Obs],
+    up_station: Option<Vec3>,
+    cfg: &SolveConfig,
+) -> Option<(StationModel, Real)> {
+    let rms = |st: &StationModel| -> Real {
+        let mut s2 = 0.0;
+        for o in obs {
+            let p = predict(st, world_from_body, model.sensors[o.sensor as usize], o.axis);
+            s2 += (p.angle - o.angle) * (p.angle - o.angle);
+        }
+        crate::math::sqrt(s2 / obs.len().max(1) as Real)
+    };
+    if obs.is_empty() {
+        return None;
+    }
+    if let Some((st, _, _)) = refine_station(model, init.clone(), world_from_body, obs, up_station, cfg) {
+        let r = rms(&st);
+        if r < 2e-3 {
+            return Some((st, r));
+        }
+    }
+    let (st, _) = bootstrap_station(model, init.cal, world_from_body, obs, up_station, cfg)?;
+    let r = rms(&st);
+    Some((st, r))
+}
+
 pub fn look_at(pos: Vec3, target: Vec3) -> Pose {
     let z = pos.sub(target).normalized();
     let mut x = Vec3::new(0.0, 0.0, 1.0).cross(z);
