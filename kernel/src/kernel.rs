@@ -1293,7 +1293,10 @@ impl Kernel {
             }
             d.last_start = Some(now);
         }
-        let up = d.last_imu.map(|x| x.1);
+        // The accelerometer is "up" only while it reads gravity alone: mid-motion it adds
+        // the tracker's own acceleration, and a bootstrap held to that tilts the pose (a
+        // fresh lock ~2 cm off while a swing came to rest).
+        let up = d.last_imu.filter(|x| crate::math::fabs(x.1.norm() - 1.0) < 0.05 && x.2.norm() < 0.5).map(|x| x.1);
         let t = d.last_imu.map_or(0, |x| x.0);
         let work = StartWork { dev: d.id, model: d.model.clone(), models, cands, up, solve: cfg.solve, t, stations_gen: self.stations_gen };
         self.dispatch(Work::Start(work), out);
