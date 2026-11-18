@@ -265,6 +265,8 @@ pub struct KernelConfig {
     /// time); 0: on every sweep. A slow host (the P4) can't bootstrap a few hundred
     /// times a second and falls behind its input.
     pub start_interval: Real,
+    /// No pose bootstrap while the gyro reads more than this (rad/s).
+    pub start_max_gyro: Real,
     /// Added to IMU sample times (s): IMU vs light latency.
     pub imu_time_offset: Real,
     /// Hand slow solves out as [`Event::Solve`] instead of running them in `push` (see the
@@ -336,6 +338,7 @@ impl Default for KernelConfig {
             moved_after: 3,
             check_stations: true,
             start_interval: 0.0,
+            start_max_gyro: 2.0,
             imu_time_offset: 0.0,
             defer_solves: false,
             max_backlog: 900,
@@ -1212,6 +1215,22 @@ impl Kernel {
                 self.check_tilt(si, up, out);
             }
             TimingEvent::OotxError { .. } => {}
+            TimingEvent::SlotShifted => {
+                // What the lock called slot 0 was the slave's: its station moves to slot 1
+                // (a track on it goes on). The master's slot is put back as before a lock loss:
+                // from the slot's old station once sweeps come from both (relock_slots), or by
+                // its OOTX.
+                let d = &mut self.devices[di];
+                let slave = d.slot_station[0];
+                d.slot_station = [None, slave];
+                if let Some(s) = slave {
+                    d.prev_slot_station[1] = Some(s);
+                    if d.prev_slot_station[0] == Some(s) {
+                        d.prev_slot_station[0] = None;
+                    }
+                }
+                d.relock_slots = 0;
+            }
             TimingEvent::Sweep(s) => self.sweep(di, s, out),
         }
     }
@@ -1603,6 +1622,11 @@ impl Kernel {
                 return;
             }
             d.last_start = Some(now);
+        }
+        // Not while it spins: the candidates span a cycle or two of sweeps, and at a few
+        // rad/s their poses differ by degrees (a lock ~8 cm off while a swing came to rest).
+        if d.last_imu.is_some_and(|x| x.2.norm() > cfg.start_max_gyro) {
+            return;
         }
         // The accelerometer is "up" only while it reads gravity alone: mid-motion it adds
         // the tracker's own acceleration, and a bootstrap held to that tilts the pose (a
