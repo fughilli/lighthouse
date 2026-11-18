@@ -18,6 +18,15 @@
 //! stations' OOTX accel vectors). Without a prior, the first calibration sets
 //! the origin at the tracker's IMU in its first still scene and the x axis
 //! along that tracker's body x (levelled). A loaded calibration keeps its frame.
+//!
+//! Slow solves (a pose bootstrap to start tracking, a station calibration, a scene's
+//! station check: up to seconds on a microcontroller) run inside [`Kernel::push`] by
+//! default. With [`KernelConfig::defer_solves`] they come out as [`Event::Solve`] instead:
+//! the host runs [`run_job`] wherever it likes (another thread, another core) and pushes
+//! the result back as [`Input::Solved`], while light and IMU keep coming in. A pose that
+//! comes back starts the track at the time it was solved for, and the sweeps that came
+//! meanwhile go through it, so the track doesn't start out in the dark. A result the world
+//! changed under (the stations were placed again meanwhile) is dropped.
 
 use crate::Real;
 use crate::lh1::AxisCal;
@@ -26,8 +35,8 @@ use crate::math::{Pose, Quat, Vec3};
 use crate::model::{StationModel, TrackerModel};
 use crate::ootx::StationInfo;
 use crate::solve::{
-    bootstrap_pose, bootstrap_pose_assoc, bootstrap_station, calibrate, quat_between, station_disagreement, CandidateObs, Obs, Scene, SolveConfig,
-    StationPrior,
+    bootstrap_pose, bootstrap_pose_assoc, bootstrap_station, calibrate, quat_between, station_disagreement, Calibration, CandidateObs, Obs,
+    PoseSolution, Scene, SolveConfig, StationPrior,
 };
 use crate::timing::{LockLoss, Pulse, SensorHits, Sweep, Timing, TimingConfig, TimingEvent};
 use crate::track::{TrackConfig, TrackState, UpdateStats};
@@ -56,6 +65,8 @@ pub enum Input {
     /// this between reports, and a sweep then goes out as soon as the laser has passed
     /// (TimingConfig::sweep_quiet_ticks) instead of at the next cycle's sync.
     Clock { dev: DeviceId, time: u32 },
+    /// The result of a job handed out as [`Event::Solve`] ([`run_job`]).
+    Solved(SolveResult),
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +129,10 @@ pub enum Event {
         gated: u32,
         speculative: bool,
     },
+    /// A slow solve to run off the input path (KernelConfig::defer_solves): [`run_job`] it
+    /// anywhere and push the result back as [`Input::Solved`]. At most one per kind (per
+    /// device for a pose bootstrap) is out at a time.
+    Solve(SolveJob),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +169,12 @@ pub struct KernelConfig {
     pub still_gyro: Real,
     pub still_accel: Real,
     pub still_window: Real,
+    /// A scene (still stretch for calibration) ends only once the accelerometer spread
+    /// passes `still_accel` times this. A tracker at rest can read right at `still_accel`
+    /// (a Vive Tracker 3.0 on the P4: 0.0040 g); without the margin its scenes restarted a
+    /// few times a second and never reached `scene_min`, so nothing was calibrated. The
+    /// filter's still updates keep the strict thresholds (a slow carry isn't still).
+    pub still_exit: Real,
     /// A still stretch becomes a scene after this long (s); one scene is cut
     /// at most this long.
     pub scene_min: Real,
@@ -212,6 +233,13 @@ pub struct KernelConfig {
     pub start_interval: Real,
     /// Added to IMU sample times (s): IMU vs light latency.
     pub imu_time_offset: Real,
+    /// Hand slow solves out as [`Event::Solve`] instead of running them in `push` (see the
+    /// module doc). For a host that can't stop taking input for a second or more.
+    pub defer_solves: bool,
+    /// Deferred: sweeps kept for a pose bootstrap that's out (to run through the track it
+    /// starts). Past this many the bootstrap is given up (its result would be too old for
+    /// the IMU history to bring forward) and a fresh one follows.
+    pub max_backlog: usize,
 }
 
 impl Default for KernelConfig {
@@ -223,6 +251,7 @@ impl Default for KernelConfig {
             still_gyro: 0.02,
             still_accel: 0.004,
             still_window: 0.3,
+            still_exit: 1.5,
             scene_min: 1.0,
             scene_max: 4.0,
             max_scenes: 16,
@@ -247,11 +276,232 @@ impl Default for KernelConfig {
             check_stations: true,
             start_interval: 0.0,
             imu_time_offset: 0.0,
+            defer_solves: false,
+            max_backlog: 900,
         }
     }
 }
 
 const TPS: Real = crate::lh1::TICKS_PER_SECOND;
+
+/// A slow solve, with everything it needs (owned): see [`Event::Solve`].
+#[derive(Clone, Debug)]
+pub struct SolveJob {
+    pub id: u32,
+    work: Work,
+}
+
+impl SolveJob {
+    /// "start", "calibrate" or "check" (logging).
+    pub fn kind(&self) -> &'static str {
+        match self.work {
+            Work::Start(_) => "start",
+            Work::Calibrate(_) => "calibrate",
+            Work::Check(_) => "check",
+        }
+    }
+}
+
+/// A job's result, for [`Input::Solved`]. Carries the job's inputs back.
+#[derive(Clone, Debug)]
+pub struct SolveResult {
+    pub id: u32,
+    work: Work,
+    done: Done,
+}
+
+#[derive(Clone, Debug)]
+enum Work {
+    Start(StartWork),
+    Calibrate(CalibWork),
+    Check(CheckWork),
+}
+
+#[derive(Clone, Debug)]
+enum Done {
+    Start(Option<PoseSolution>),
+    Calibrate(Result<CalibDone, &'static str>),
+    Check(Option<(Real, Real)>),
+}
+
+/// A pose bootstrap to start tracking a device.
+#[derive(Clone, Debug)]
+struct StartWork {
+    dev: DeviceId,
+    model: TrackerModel,
+    models: Vec<StationModel>,
+    cands: Vec<CandidateObs>,
+    up: Option<Vec3>,
+    solve: SolveConfig,
+    /// The device time the pose is for (its newest IMU sample then).
+    t: i64,
+    stations_gen: u64,
+}
+
+/// A station calibration: the scenes and stations as they were when it was asked for.
+#[derive(Clone, Debug)]
+struct CalibWork {
+    reason: CalibrationReason,
+    ids: Vec<u32>,
+    ref_idx: usize,
+    reference: u32,
+    from_scratch: bool,
+    scenes: Vec<SceneRecord>,
+    /// Per scene: its device's tracker model (None: the device is gone).
+    scene_models: Vec<Option<TrackerModel>>,
+    scene_poses: Vec<Option<Pose>>,
+    models: Vec<Option<StationModel>>,
+    cals: Vec<[AxisCal; 2]>,
+    ups: Vec<Option<Vec3>>,
+    priors: Vec<Option<StationPrior>>,
+    min_sensors: usize,
+    solve: SolveConfig,
+    reject: Real,
+    stations_gen: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CalibDone {
+    known: Vec<usize>,
+    cal: Calibration,
+    scene_poses: Vec<Option<Pose>>,
+    dev0: DeviceId,
+    scenes: usize,
+}
+
+/// A still scene checked against the calibrated stations it sees.
+#[derive(Clone, Debug)]
+struct CheckWork {
+    dev: DeviceId,
+    scene: u64,
+    model: TrackerModel,
+    known: Vec<StationModel>,
+    obs: Vec<Obs>,
+    up: Vec3,
+    min_sensors: usize,
+    solve: SolveConfig,
+    stations_gen: u64,
+}
+
+/// Runs a job from [`Event::Solve`]: pure, touches no kernel, so any thread can.
+pub fn run_job(job: SolveJob) -> SolveResult {
+    let done = match &job.work {
+        Work::Start(w) => Done::Start(bootstrap_pose_assoc(&w.model, &w.models, &w.cands, w.up, 3e-3, &w.solve)),
+        Work::Calibrate(w) => Done::Calibrate(run_calibration(w)),
+        Work::Check(w) => Done::Check(station_disagreement(&w.model, &w.known, &w.obs, w.up, w.min_sensors, &w.solve)),
+    };
+    SolveResult { id: job.id, work: job.work, done }
+}
+
+/// Poses the scenes without one against the stations placed so far (`models`, by index
+/// into `ids`).
+fn pose_scenes(w: &CalibWork, models: &[Option<StationModel>], scene_poses: &mut [Option<Pose>]) {
+    let known: Vec<usize> = (0..w.ids.len()).filter(|&k| models[k].is_some()).collect();
+    if known.is_empty() {
+        return;
+    }
+    let km: Vec<StationModel> = known.iter().map(|&k| models[k].clone().unwrap()).collect();
+    for j in 0..w.scenes.len() {
+        if scene_poses[j].is_some() {
+            continue;
+        }
+        let sc = &w.scenes[j];
+        let Some(model) = w.scene_models[j].as_ref() else { continue };
+        let mut obs = Vec::new();
+        for (ki, &k) in known.iter().enumerate() {
+            for (axis, sensor, angle) in first_obs(sc, w.ids[k]) {
+                obs.push(Obs { station: ki, axis, sensor: sensor as u16, angle });
+            }
+        }
+        if let Some(sol) = bootstrap_pose(model, &km, &obs, Some(sc.up_body), &w.solve) {
+            if sol.rms < 3e-3 {
+                scene_poses[j] = Some(sol.world_from_body);
+            }
+        }
+    }
+}
+
+/// The solving part of a station calibration (Kernel::plan_calibration has the rest).
+fn run_calibration(w: &CalibWork) -> Result<CalibDone, &'static str> {
+    let mut scene_poses = w.scene_poses.clone();
+    let mut models = w.models.clone();
+    if !w.from_scratch {
+        // Scenes collected before tracking started have no pose yet: place them against
+        // the stations already known first, so a station seen only in such scenes can be
+        // solved from them right away.
+        pose_scenes(w, &models, &mut scene_poses);
+    }
+    // Stations without a pose: solve each from a scene with a known pose.
+    for (k, id) in w.ids.iter().enumerate() {
+        if models[k].is_some() {
+            continue;
+        }
+        let cand = w
+            .scenes
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| scene_poses[*j].is_some() && w.scene_models[*j].is_some())
+            .max_by_key(|(_, sc)| sensors_seen(sc, *id));
+        let Some((j, sc)) = cand else { continue };
+        if sensors_seen(sc, *id) < w.min_sensors {
+            continue;
+        }
+        let obs: Vec<Obs> = first_obs(sc, *id).into_iter().map(|(axis, sensor, angle)| Obs { station: 0, axis, sensor: sensor as u16, angle }).collect();
+        let model = w.scene_models[j].as_ref().unwrap();
+        if let Some((st, _)) = bootstrap_station(model, w.cals[k], &scene_poses[j].unwrap(), &obs, w.ups[k], &w.solve) {
+            models[k] = Some(st);
+        }
+    }
+    let known: Vec<usize> = (0..w.ids.len()).filter(|&k| models[k].is_some()).collect();
+    if !known.contains(&w.ref_idx) {
+        return Err("the reference station could not be placed");
+    }
+    // Scenes without a pose: bootstrap against the known stations.
+    let km: Vec<StationModel> = known.iter().map(|&k| models[k].clone().unwrap()).collect();
+    pose_scenes(w, &models, &mut scene_poses);
+    // Joint fit over the known stations and posed scenes (one tracker model per scene's
+    // device; scenes from other devices skipped for now). The device with the most posed
+    // scenes: the first scene's may be gone (a tracker that dropped off the radio and
+    // came back as a new device), and its scenes with it.
+    let mut devs: Vec<(DeviceId, usize)> = Vec::new();
+    for (j, sc) in w.scenes.iter().enumerate() {
+        if scene_poses[j].is_none() {
+            continue;
+        }
+        match devs.iter_mut().find(|x| x.0 == sc.dev) {
+            Some(x) => x.1 += 1,
+            None => devs.push((sc.dev, 1)),
+        }
+    }
+    let Some(dev0) = devs.iter().max_by_key(|x| x.1).map(|x| x.0) else { return Err("no still scene could be placed") };
+    let model = (0..w.scenes.len()).find(|&j| w.scenes[j].dev == dev0).and_then(|j| w.scene_models[j].clone());
+    let Some(model) = model else { return Err("no still scene could be placed") };
+    let mut scenes = Vec::new();
+    for (j, sc) in w.scenes.iter().enumerate() {
+        let (Some(p), true) = (scene_poses[j], sc.dev == dev0) else { continue };
+        let mut obs = Vec::new();
+        for (ki, &k) in known.iter().enumerate() {
+            for o in sc.obs.iter().filter(|o| o.0 == w.ids[k]) {
+                obs.push(Obs { station: ki, axis: o.1, sensor: o.2 as u16, angle: o.3 });
+            }
+        }
+        scenes.push(Scene { obs, up_body: sc.up_body, world_from_body: p });
+    }
+    if scenes.is_empty() {
+        return Err("no still scene could be placed");
+    }
+    let ref_in_known = known.iter().position(|&k| k == w.ref_idx).unwrap();
+    let ups: Vec<Option<Vec3>> = known.iter().map(|&k| w.ups[k]).collect();
+    let priors: Vec<Option<StationPrior>> = known.iter().map(|&k| w.priors[k]).collect();
+    let Some(cal) = calibrate(&model, &km, &ups, &priors, &scenes, ref_in_known, &w.solve, w.reject) else {
+        return Err("the station fit failed");
+    };
+    // Quality gate: residuals a few σ at most.
+    if cal.rms.iter().any(|r| !(*r < 3e-3)) {
+        return Err("the station fit's residuals are too large");
+    }
+    Ok(CalibDone { known, cal, scene_poses, dev0, scenes: scenes.len() })
+}
 
 /// Device ticks (u32, wrapping) to a monotonic timeline.
 #[derive(Clone, Copy, Debug, Default)]
@@ -290,6 +540,10 @@ struct StillDetector {
     acc: VecDeque<(i64, Real)>,
     still: bool,
     since: i64,
+    /// Still for collecting a scene: as `still`, but once still it takes `still_exit` times
+    /// the accelerometer threshold to end (see KernelConfig::still_exit).
+    scene_still: bool,
+    scene_since: i64,
 }
 
 struct Cluster {
@@ -344,8 +598,10 @@ impl SceneBuilder {
 }
 
 /// A finished still scene, stations by id.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SceneRecord {
+    /// Kept when the scene is refreshed (the same place again).
+    id: u64,
     dev: DeviceId,
     up_body: Vec3,
     /// (station id, axis, sensor, angle, count), several per key possible.
@@ -388,6 +644,10 @@ struct Device {
     innovations: Vec<((u32, u8), Real, Real, u32)>,
     /// Station id → index of its angle-bias states in the tracker filter.
     bias_slots: Vec<u32>,
+    /// A pose bootstrap out (defer_solves): its job id, and the sweeps since (station,
+    /// axis, part, hits at unwrapped times) to run through the track it starts.
+    start_pending: Option<u32>,
+    backlog: Vec<(u32, u8, u8, Vec<(i64, SensorHits)>)>,
 }
 
 pub struct Kernel {
@@ -404,6 +664,15 @@ pub struct Kernel {
     /// A calibration was solved from scratch in this session: disagreement
     /// then means it needs more scenes (which refine it), not a reset.
     solved_here: bool,
+    /// Bumped whenever a station's pose changes: a solve made before is for another world.
+    stations_gen: u64,
+    next_job: u32,
+    next_scene: u64,
+    /// The calibration / station check out (defer_solves), and a calibration asked for
+    /// while one was out (run when it's back).
+    cal_pending: Option<u32>,
+    cal_again: Option<CalibrationReason>,
+    check_pending: Option<u32>,
 }
 
 impl Kernel {
@@ -418,6 +687,12 @@ impl Kernel {
             disagreeing: 0,
             moved: false,
             solved_here: false,
+            stations_gen: 0,
+            next_job: 0,
+            next_scene: 0,
+            cal_pending: None,
+            cal_again: None,
+            check_pending: None,
         }
     }
 
@@ -450,6 +725,8 @@ impl Kernel {
                     window: UpdateStats::default(),
                     innovations: Vec::new(),
                     bias_slots: Vec::new(),
+                    start_pending: None,
+                    backlog: Vec::new(),
                 });
                 out.push(Event::DeviceAdded { dev });
             }
@@ -490,12 +767,14 @@ impl Kernel {
                 let sr = sd(3).max(sd(4)).max(sd(5)).max(2e-3);
                 st.prior = Some(StationPrior { pose: world_from_station, sigma_pos: sp, sigma_rot: sr });
                 st.cov = Some(cov);
+                self.stations_gen += 1;
                 self.world_fixed = true;
                 if self.reference.is_none() {
                     self.reference = Some(id);
                 }
             }
             Input::Recalibrate => self.calibrate(CalibrationReason::Requested, out),
+            Input::Solved(r) => self.apply(r, true, out),
         }
     }
 
@@ -563,15 +842,29 @@ impl Kernel {
         let asd = crate::math::sqrt(d.still.acc.iter().map(|x| (x.1 - am) * (x.1 - am)).sum::<Real>() / n);
         let full = d.still.gyro.front().map_or(false, |x| x.0 <= t - w * 9 / 10);
         let still = full && g < cfg.still_gyro && asd < cfg.still_accel;
+        let k = if d.still.scene_still { cfg.still_exit } else { 1.0 };
+        let scene_still = full && g < cfg.still_gyro && asd < cfg.still_accel * k;
+        let mut scene_ended = false;
+        if scene_still != d.still.scene_still {
+            d.still.scene_still = scene_still;
+            d.still.scene_since = t;
+            scene_ended = !scene_still;
+        }
         if still != d.still.still {
             d.still.still = still;
             d.still.since = t;
             out.push(Event::Still { dev, still });
             if !still {
-                self.finish_scene(di, out);
+                if scene_ended {
+                    self.finish_scene(di, out);
+                }
                 return;
             }
         }
+        if scene_ended {
+            self.finish_scene(di, out);
+        }
+        let d = &mut self.devices[di];
         let d = &mut self.devices[di];
         // In the dark (no hit used for coast_after): dead reckon on the IMU, judged on the
         // IMU clock (no sweep comes while both stations are blocked).
@@ -633,12 +926,12 @@ impl Kernel {
                 d.window = UpdateStats::default();
             }
         }
-        if still {
+        if scene_still {
             if let Some(sb) = d.scene.as_mut() {
                 sb.acc_sum = sb.acc_sum.add(accel_g);
                 sb.acc_n += 1;
             }
-            let dur = (t - d.still.since) as Real / TPS;
+            let dur = (t - d.still.scene_since) as Real / TPS;
             if d.scene.is_none() && dur >= 0.3 {
                 d.scene = Some(SceneBuilder { start: t, clusters: Vec::new(), acc_sum: Vec3::ZERO, acc_n: 0 });
             }
@@ -646,7 +939,7 @@ impl Kernel {
                 self.finish_scene(di, out);
                 // Keep collecting the next scene only if this stays still a while.
                 let d = &mut self.devices[di];
-                d.still.since = t;
+                d.still.scene_since = t;
             }
         }
     }
@@ -669,7 +962,8 @@ impl Kernel {
         }
         let up = sb.acc_sum.scale(1.0 / sb.acc_n as Real);
         let pose = d.track.as_ref().map(|t| t.pose());
-        let mut rec = SceneRecord { dev: d.id, up_body: up.normalized(), obs, pose };
+        let mut rec = SceneRecord { id: self.next_scene, dev: d.id, up_body: up.normalized(), obs, pose };
+        self.next_scene += 1;
         // Only scenes that see some station well.
         let min = self.cfg.scene_min_sensors;
         let usable = rec.obs.iter().map(|o| o.0).any(|st| sensors_seen(&rec, st) >= min);
@@ -693,7 +987,8 @@ impl Kernel {
             let old = &self.scenes[j];
             let newly_seen = rec.obs.iter().any(|o| sensors_seen(&rec, o.0) >= min && sensors_seen(old, o.0) < min);
             let pose = old.pose;
-            self.scenes[j] = SceneRecord { pose: pose.or(rec.pose), ..rec };
+            let id = old.id;
+            self.scenes[j] = SceneRecord { id, pose: pose.or(rec.pose), ..rec };
             if self.cfg.auto_calibrate && (self.moved || newly_seen) {
                 let reason = self.auto_reason(j);
                 self.calibrate(reason, out);
@@ -805,9 +1100,10 @@ impl Kernel {
         if let Some(sb) = self.devices[di].scene.as_mut() {
             sb.add(sid, s.axis, &s.hits);
         }
-        let Some(si) = self.stations.iter().position(|x| x.id == sid) else { return };
-        let Some(station) = self.stations[si].model.clone() else { return };
-        let station_cov = self.stations[si].cov.clone();
+        // Only light from a placed station is used.
+        if !self.stations.iter().any(|x| x.id == sid && x.model.is_some()) {
+            return;
+        }
         let cfg = self.cfg;
         let d = &mut self.devices[di];
 
@@ -827,9 +1123,30 @@ impl Kernel {
             while d.recent.len() > 8 {
                 d.recent.pop_front();
             }
+            if d.start_pending.is_some() {
+                // A bootstrap is out: keep the light for the track it may start.
+                if d.backlog.len() >= cfg.max_backlog {
+                    d.start_pending = None; // too old by the time it's back
+                    d.backlog.clear();
+                } else {
+                    let hits = unwrap_hits(&mut d.clock, &s.hits);
+                    d.backlog.push((sid, s.axis, s.part, hits));
+                }
+            }
             self.try_start_tracking(di, out);
             return;
         }
+        let hits = unwrap_hits(&mut self.devices[di].clock, &s.hits);
+        self.track_sweep(di, sid, s.axis, s.part, hits, true, out);
+    }
+
+    /// A sweep's hits (unwrapped times, in time order) through a device's track: `publish`
+    /// its pose after.
+    fn track_sweep(&mut self, di: usize, sid: u32, axis: u8, part: u8, hits: Vec<(i64, SensorHits)>, publish: bool, out: &mut Vec<Event>) {
+        let Some(si) = self.stations.iter().position(|x| x.id == sid) else { return };
+        let Some(station) = self.stations[si].model.clone() else { return };
+        let station_cov = self.stations[si].cov.clone();
+        let cfg = self.cfg;
 
         // Angle-bias states only with two or more calibrated stations: with one,
         // a bias can't be told apart from the tracker moving.
@@ -847,17 +1164,11 @@ impl Kernel {
                 None => None,
             }
         };
-        // Hits in time order; the filter follows the IMU up to each.
-        let mut hits: Vec<(i64, SensorHits)> = Vec::new();
-        for h in &s.hits {
-            let t = d.clock.unwrap(h.candidates[0].time);
-            hits.push((t, h.clone()));
-        }
-        hits.sort_by_key(|h| h.0);
+        // The filter follows the IMU up to each hit.
         let mut stats = UpdateStats::default();
         {
             let track = d.track.as_mut().unwrap();
-            if s.part == 0 {
+            if part == 0 {
                 track.begin_sweep(cfg.track.sigma_sweep);
             }
             for (t, h) in &hits {
@@ -868,20 +1179,20 @@ impl Kernel {
                     &station,
                     if cfg.station_cov_in_filter { station_cov.as_ref() } else { None },
                     station_slot,
-                    s.axis,
+                    axis,
                     h,
                     &cfg.track,
                     &mut stats,
                 );
                 if stats.used > before {
                     let r = stats.last_innovation;
-                    match d.innovations.iter_mut().find(|e| e.0 == (sid, s.axis)) {
+                    match d.innovations.iter_mut().find(|e| e.0 == (sid, axis)) {
                         Some(e) => {
                             e.1 += r;
                             e.2 += r * r;
                             e.3 += 1;
                         }
-                        None => d.innovations.push(((sid, s.axis), r, r * r, 1)),
+                        None => d.innovations.push(((sid, axis), r, r * r, 1)),
                     }
                 }
             }
@@ -928,6 +1239,9 @@ impl Kernel {
             out.push(Event::TrackingLost { dev: d.id, reason });
             return;
         }
+        if !publish {
+            return;
+        }
         // Publish at the newest IMU time (a propagated copy; the filter stays
         // at the light).
         let mut pubst = track.clone();
@@ -952,6 +1266,9 @@ impl Kernel {
     }
 
     fn try_start_tracking(&mut self, di: usize, out: &mut Vec<Event>) {
+        if self.devices[di].start_pending.is_some() {
+            return;
+        }
         let cfg = self.cfg;
         // Stations involved, in solver order.
         let ids: Vec<u32> = {
@@ -1001,18 +1318,89 @@ impl Kernel {
             }
             d.last_start = Some(now);
         }
-        let up = d.last_imu.map(|x| x.1);
-        let Some(sol) = bootstrap_pose_assoc(&d.model, &models, &cands, up, 3e-3, &cfg.solve) else { return };
+        // The accelerometer is "up" only while it reads gravity alone: mid-motion it adds
+        // the tracker's own acceleration, and a bootstrap held to that tilts the pose (a
+        // fresh lock ~2 cm off while a swing came to rest).
+        let up = d.last_imu.filter(|x| crate::math::fabs(x.1.norm() - 1.0) < 0.05 && x.2.norm() < 0.5).map(|x| x.1);
+        let t = d.last_imu.map_or(0, |x| x.0);
+        let work = StartWork { dev: d.id, model: d.model.clone(), models, cands, up, solve: cfg.solve, t, stations_gen: self.stations_gen };
+        self.dispatch(Work::Start(work), out);
+    }
+
+    /// A pose bootstrap is back: start the track at the time it was solved for, then run
+    /// the light that came meanwhile through it.
+    fn apply_start(&mut self, id: u32, w: StartWork, sol: Option<PoseSolution>, out: &mut Vec<Event>) {
+        let cfg = self.cfg;
+        let Some(di) = self.devices.iter().position(|d| d.id == w.dev) else { return };
+        let d = &mut self.devices[di];
+        if d.start_pending != Some(id) {
+            return; // given up, or the device came back as a new one
+        }
+        d.start_pending = None;
+        let backlog = core::mem::take(&mut d.backlog);
+        let Some(sol) = sol else { return };
+        if w.stations_gen != self.stations_gen || d.track.is_some() {
+            return; // solved against stations that have moved since
+        }
         if !(sol.rms < 2e-3) || sol.inliers < 8 || sol.inliers * 3 < sol.obs * 2 {
             return;
         }
-        let t = d.last_imu.map_or(0, |x| x.0);
-        d.track = Some(TrackState::new(&sol.world_from_body, &sol.cov.scale(4.0), t, cfg.track.angle_bias_init));
-        d.last_used = t;
+        d.track = Some(TrackState::new(&sol.world_from_body, &sol.cov.scale(4.0), w.t, cfg.track.angle_bias_init));
+        d.last_used = w.t;
         d.gated_run = 0;
         d.coasting = false;
         d.recent.clear();
         out.push(Event::TrackingStarted { dev: d.id, rms: sol.rms });
+        let n = backlog.len();
+        for (i, (sid, axis, part, hits)) in backlog.into_iter().enumerate() {
+            if self.devices[di].track.is_none() {
+                break;
+            }
+            self.track_sweep(di, sid, axis, part, hits, i + 1 == n, out);
+        }
+    }
+
+    /// Runs a slow solve here, or hands it out (defer_solves).
+    fn dispatch(&mut self, work: Work, out: &mut Vec<Event>) {
+        let id = self.next_job;
+        self.next_job = self.next_job.wrapping_add(1);
+        match &work {
+            Work::Start(w) => {
+                if let Some(d) = self.devices.iter_mut().find(|d| d.id == w.dev) {
+                    d.start_pending = Some(id);
+                    d.backlog.clear();
+                }
+            }
+            Work::Calibrate(_) => self.cal_pending = Some(id),
+            Work::Check(_) => self.check_pending = Some(id),
+        }
+        let job = SolveJob { id, work };
+        if self.cfg.defer_solves {
+            out.push(Event::Solve(job));
+        } else {
+            self.apply(run_job(job), false, out);
+        }
+    }
+
+    /// A solve's result (`deferred`: it came back as Input::Solved).
+    fn apply(&mut self, r: SolveResult, deferred: bool, out: &mut Vec<Event>) {
+        match (r.work, r.done) {
+            (Work::Start(w), Done::Start(sol)) => self.apply_start(r.id, w, sol, out),
+            (Work::Calibrate(w), Done::Calibrate(res)) => self.apply_calibration(r.id, w, res, out),
+            (Work::Check(w), Done::Check(d)) => {
+                let scene = w.scene;
+                if self.apply_check(r.id, w, d, out) && deferred && self.cfg.auto_calibrate {
+                    // The calibration was dropped after finish_scene ran (inline, it goes on
+                    // to solve it again from this scene): solve it again now.
+                    let reason = match self.scenes.iter().position(|sc| sc.id == scene) {
+                        Some(j) => self.auto_reason(j),
+                        None => CalibrationReason::StationsMoved,
+                    };
+                    self.calibrate(reason, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------ calibration
@@ -1040,15 +1428,42 @@ impl Kernel {
                 obs.push(Obs { station: k, axis, sensor: sensor as u16, angle });
             }
         }
-        let Some((pos, rot)) = station_disagreement(&model, &known, &obs, rec.up_body, cfg.scene_min_sensors, &cfg.solve) else { return };
+        if self.check_pending.is_some() {
+            return; // one out already; the next scene is checked
+        }
+        let work = CheckWork {
+            dev: rec.dev,
+            scene: rec.id,
+            model,
+            known,
+            obs,
+            up: rec.up_body,
+            min_sensors: cfg.scene_min_sensors,
+            solve: cfg.solve,
+            stations_gen: self.stations_gen,
+        };
+        self.dispatch(Work::Check(work), out);
+    }
+
+    /// A station check is back: true if it dropped the calibration.
+    fn apply_check(&mut self, id: u32, w: CheckWork, d: Option<(Real, Real)>, out: &mut Vec<Event>) -> bool {
+        let cfg = self.cfg;
+        if self.check_pending != Some(id) {
+            return false;
+        }
+        self.check_pending = None;
+        if w.stations_gen != self.stations_gen {
+            return false;
+        }
+        let Some((pos, rot)) = d else { return false };
         if pos <= cfg.moved_pos && rot <= cfg.moved_rot {
             self.disagreeing = 0;
-            return;
+            return false;
         }
         self.disagreeing += 1;
-        out.push(Event::StationsDisagree { dev: rec.dev, pos, rot, count: self.disagreeing });
+        out.push(Event::StationsDisagree { dev: w.dev, pos, rot, count: self.disagreeing });
         if self.disagreeing < cfg.moved_after || self.solved_here {
-            return;
+            return false;
         }
         // Forget every station pose (and the world frame they defined) and the
         // scene poses tracked with them; the scenes' angles stay, and the
@@ -1067,16 +1482,30 @@ impl Kernel {
                 out.push(Event::TrackingLost { dev: d.id, reason: TrackLoss::StationsMoved });
             }
         }
+        self.stations_gen += 1;
         self.reference = None;
         self.world_fixed = false;
         self.disagreeing = 0;
         self.moved = true;
+        true
     }
 
     fn calibrate(&mut self, reason: CalibrationReason, out: &mut Vec<Event>) {
-        if let Err(why) = self.try_calibrate(reason, out) {
-            if reason != CalibrationReason::MoreScenes {
-                out.push(Event::CalibrationSkipped { reason, why });
+        if self.cal_pending.is_some() {
+            // One is out: this one runs when it's back (a routine refinement gives way to
+            // any other reason).
+            self.cal_again = match self.cal_again {
+                Some(r) if r != CalibrationReason::MoreScenes => Some(r),
+                _ => Some(reason),
+            };
+            return;
+        }
+        match self.plan_calibration(reason) {
+            Ok(work) => self.dispatch(Work::Calibrate(work), out),
+            Err(why) => {
+                if reason != CalibrationReason::MoreScenes {
+                    out.push(Event::CalibrationSkipped { reason, why });
+                }
             }
         }
     }
@@ -1087,35 +1516,8 @@ impl Kernel {
         self.devices.iter().any(|d| d.id == sc.dev)
     }
 
-    /// Poses the scenes without one against the stations placed so far (`models`, by
-    /// index into `ids`).
-    fn pose_scenes(&self, ids: &[u32], models: &[Option<StationModel>], scene_poses: &mut [Option<Pose>]) {
-        let known: Vec<usize> = (0..ids.len()).filter(|&k| models[k].is_some()).collect();
-        if known.is_empty() {
-            return;
-        }
-        let km: Vec<StationModel> = known.iter().map(|&k| models[k].clone().unwrap()).collect();
-        for j in 0..self.scenes.len() {
-            if scene_poses[j].is_some() {
-                continue;
-            }
-            let sc = &self.scenes[j];
-            let Some(model) = self.devices.iter().find(|d| d.id == sc.dev).map(|d| d.model.clone()) else { continue };
-            let mut obs = Vec::new();
-            for (ki, &k) in known.iter().enumerate() {
-                for (axis, sensor, angle) in first_obs(sc, ids[k]) {
-                    obs.push(Obs { station: ki, axis, sensor: sensor as u16, angle });
-                }
-            }
-            if let Some(sol) = bootstrap_pose(&model, &km, &obs, Some(sc.up_body), &self.cfg.solve) {
-                if sol.rms < 3e-3 {
-                    scene_poses[j] = Some(sol.world_from_body);
-                }
-            }
-        }
-    }
-
-    fn try_calibrate(&mut self, reason: CalibrationReason, out: &mut Vec<Event>) -> Result<(), &'static str> {
+    /// What a calibration needs, as things are now (run_calibration solves it).
+    fn plan_calibration(&mut self, reason: CalibrationReason) -> Result<CalibWork, &'static str> {
         if !self.scenes.iter().any(|sc| self.scene_usable(sc)) {
             return Err("no still scenes from a connected tracker");
         }
@@ -1141,16 +1543,19 @@ impl Kernel {
         };
         let ref_idx = ids.iter().position(|x| *x == reference).unwrap();
 
-        // Scene poses: tracked pose if there was one, else solved below.
+        // Scene poses: tracked pose if there was one, else solved by run_calibration.
         let mut scene_poses: Vec<Option<Pose>> = self.scenes.iter().map(|s| if self.scene_usable(s) { s.pose } else { None }).collect();
-        let mut models: Vec<Option<StationModel>> =
+        let models: Vec<Option<StationModel>> =
             ids.iter().map(|id| self.stations.iter().find(|s| s.id == *id).unwrap().model.clone()).collect();
-        let cal_of = |k: &Kernel, id: u32| k.stations.iter().find(|s| s.id == id).unwrap().cal.unwrap();
-        let up_of = |k: &Kernel, id: u32| -> Option<Vec3> {
-            k.stations.iter().find(|s| s.id == id).unwrap().info.as_ref().map(|i| {
-                Vec3::new(i.accel_dir[0] as Real, i.accel_dir[1] as Real, i.accel_dir[2] as Real).normalized()
+        let entry = |id: u32| self.stations.iter().find(|s| s.id == id).unwrap();
+        let cals: Vec<[AxisCal; 2]> = ids.iter().map(|id| entry(*id).cal.unwrap()).collect();
+        let ups: Vec<Option<Vec3>> = ids
+            .iter()
+            .map(|id| {
+                entry(*id).info.as_ref().map(|i| Vec3::new(i.accel_dir[0] as Real, i.accel_dir[1] as Real, i.accel_dir[2] as Real).normalized())
             })
-        };
+            .collect();
+        let priors: Vec<Option<StationPrior>> = ids.iter().map(|id| entry(*id).prior).collect();
 
         // Bootstrap: nothing known at all. The first usable scene defines the
         // world (tracker at the origin, levelled, body x as world x).
@@ -1165,127 +1570,112 @@ impl Kernel {
             let rot = Quat::from_rotvec(Vec3::new(0.0, 0.0, -yaw)).mul(level).normalized();
             scene_poses[first] = Some(Pose { pos: Vec3::ZERO, rot });
             self.world_fixed = true;
-        } else {
-            // Scenes collected before tracking started have no pose yet: place them
-            // against the stations already known first, so a station seen only in such
-            // scenes can be solved from them right away.
-            self.pose_scenes(&ids, &models, &mut scene_poses);
         }
-        // Stations without a pose: solve each from a scene with a known pose.
-        for (k, id) in ids.iter().enumerate() {
-            if models[k].is_some() {
-                continue;
-            }
-            let cand = self
-                .scenes
-                .iter()
-                .enumerate()
-                .filter(|(j, sc)| scene_poses[*j].is_some() && self.scene_usable(sc))
-                .max_by_key(|(_, sc)| sensors_seen(sc, *id));
-            let Some((j, sc)) = cand else { continue };
-            if sensors_seen(sc, *id) < cfg.scene_min_sensors {
-                continue;
-            }
-            let obs: Vec<Obs> = first_obs(sc, *id).into_iter().map(|(axis, sensor, angle)| Obs { station: 0, axis, sensor: sensor as u16, angle }).collect();
-            let model = &self.devices.iter().find(|d| d.id == sc.dev).map(|d| d.model.clone());
-            let Some(model) = model else { continue };
-            if let Some((st, _)) = bootstrap_station(model, cal_of(self, *id), &scene_poses[j].unwrap(), &obs, up_of(self, *id), &cfg.solve) {
-                models[k] = Some(st);
-            }
+        let scene_models: Vec<Option<TrackerModel>> =
+            self.scenes.iter().map(|sc| self.devices.iter().find(|d| d.id == sc.dev).map(|d| d.model.clone())).collect();
+        Ok(CalibWork {
+            reason,
+            ids,
+            ref_idx,
+            reference,
+            from_scratch,
+            scenes: self.scenes.clone(),
+            scene_models,
+            scene_poses,
+            models,
+            cals,
+            ups,
+            priors,
+            min_sensors: cfg.scene_min_sensors,
+            solve: cfg.solve,
+            reject: cfg.calib_reject,
+            stations_gen: self.stations_gen,
+        })
+    }
+
+    /// A calibration is back: the stations (and the scene poses refined with them) as it
+    /// solved them, unless they were placed otherwise meanwhile (then it runs again).
+    fn apply_calibration(&mut self, id: u32, w: CalibWork, res: Result<CalibDone, &'static str>, out: &mut Vec<Event>) {
+        let cfg = self.cfg;
+        if self.cal_pending != Some(id) {
+            return;
         }
-        let known: Vec<usize> = (0..ids.len()).filter(|&k| models[k].is_some()).collect();
-        if !known.contains(&ref_idx) {
-            return Err("the reference station could not be placed");
+        self.cal_pending = None;
+        let again = self.cal_again.take();
+        let reason = w.reason;
+        if w.stations_gen != self.stations_gen {
+            self.calibrate(again.unwrap_or(reason), out);
+            return;
         }
-        // Scenes without a pose: bootstrap against the known stations.
-        let km: Vec<StationModel> = known.iter().map(|&k| models[k].clone().unwrap()).collect();
-        self.pose_scenes(&ids, &models, &mut scene_poses);
-        // Joint fit over the known stations and posed scenes (one tracker
-        // model per scene's device; scenes from other devices skipped for now). The device
-        // with the most posed scenes: the first scene's may be gone (a tracker that dropped
-        // off the radio and came back as a new device), and its scenes with it.
-        let mut devs: Vec<(DeviceId, usize)> = Vec::new();
-        for (j, sc) in self.scenes.iter().enumerate() {
-            if scene_poses[j].is_none() {
-                continue;
-            }
-            match devs.iter_mut().find(|x| x.0 == sc.dev) {
-                Some(x) => x.1 += 1,
-                None => devs.push((sc.dev, 1)),
-            }
-        }
-        let Some(dev0) = devs.iter().max_by_key(|x| x.1).map(|x| x.0) else { return Err("no still scene could be placed") };
-        let Some(model) = self.devices.iter().find(|d| d.id == dev0).map(|d| d.model.clone()) else { return Err("no still scene could be placed") };
-        let mut scenes = Vec::new();
-        for (j, sc) in self.scenes.iter().enumerate() {
-            let (Some(p), true) = (scene_poses[j], sc.dev == dev0) else { continue };
-            let mut obs = Vec::new();
-            for (ki, &k) in known.iter().enumerate() {
-                for o in sc.obs.iter().filter(|o| o.0 == ids[k]) {
-                    obs.push(Obs { station: ki, axis: o.1, sensor: o.2 as u16, angle: o.3 });
+        match res {
+            Err(why) => {
+                if reason != CalibrationReason::MoreScenes {
+                    out.push(Event::CalibrationSkipped { reason, why });
                 }
             }
-            scenes.push(Scene { obs, up_body: sc.up_body, world_from_body: p });
-        }
-        if scenes.is_empty() {
-            return Err("no still scene could be placed");
-        }
-        let ref_in_known = known.iter().position(|&k| k == ref_idx).unwrap();
-        let ups: Vec<Option<Vec3>> = known.iter().map(|&k| up_of(self, ids[k])).collect();
-        let priors: Vec<Option<StationPrior>> =
-            known.iter().map(|&k| self.stations.iter().find(|s| s.id == ids[k]).and_then(|s| s.prior)).collect();
-        let Some(cal) = calibrate(&model, &km, &ups, &priors, &scenes, ref_in_known, &cfg.solve, cfg.calib_reject) else {
-            return Err("the station fit failed");
-        };
-        // Quality gate: residuals a few σ at most.
-        if cal.rms.iter().any(|r| !(*r < 3e-3)) {
-            return Err("the station fit's residuals are too large");
-        }
-        let mut reports = Vec::new();
-        for (ki, &k) in known.iter().enumerate() {
-            let id = ids[k];
-            let si = self.station_index(id);
-            let st = &mut self.stations[si];
-            st.model = Some(cal.stations[ki].clone());
-            st.cov = Some(cal.station_cov[ki].clone());
-            reports.push(StationReport {
-                id,
-                mode: st.info.as_ref().map(|i| i.mode),
-                world_from_station: cal.stations[ki].world_from_station,
-                cov: cal.station_cov[ki].clone(),
-                rms: cal.rms[ki],
-                up_error: cal.station_up_error[ki],
-                cal: cal.stations[ki].cal,
-            });
-        }
-        self.reference = Some(reference);
-        self.moved = false;
-        self.solved_here |= from_scratch;
-        // Scene poses refined by the fit (for the next round).
-        let mut it = cal.scenes.iter();
-        for (j, sc) in self.scenes.iter_mut().enumerate() {
-            if scene_poses[j].is_some() && sc.dev == dev0 {
-                sc.pose = it.next().copied();
+            Ok(done) => {
+                let cal = &done.cal;
+                let mut reports = Vec::new();
+                for (ki, &k) in done.known.iter().enumerate() {
+                    let sid = w.ids[k];
+                    let si = self.station_index(sid);
+                    let st = &mut self.stations[si];
+                    st.model = Some(cal.stations[ki].clone());
+                    st.cov = Some(cal.station_cov[ki].clone());
+                    reports.push(StationReport {
+                        id: sid,
+                        mode: st.info.as_ref().map(|i| i.mode),
+                        world_from_station: cal.stations[ki].world_from_station,
+                        cov: cal.station_cov[ki].clone(),
+                        rms: cal.rms[ki],
+                        up_error: cal.station_up_error[ki],
+                        cal: cal.stations[ki].cal,
+                    });
+                }
+                self.stations_gen += 1;
+                self.reference = Some(w.reference);
+                self.moved = false;
+                self.solved_here |= w.from_scratch;
+                // Scene poses refined by the fit (for the next round), onto the scenes as
+                // they are now (by id: some may have been refreshed or dropped meanwhile).
+                let mut it = cal.scenes.iter();
+                for (j, sc) in w.scenes.iter().enumerate() {
+                    if done.scene_poses[j].is_some() && sc.dev == done.dev0 {
+                        let p = it.next().copied();
+                        if let Some(cur) = self.scenes.iter_mut().find(|c| c.id == sc.id) {
+                            cur.pose = p;
+                        }
+                    }
+                }
+                // Stations named and seen well that this round still couldn't place.
+                let pending: Vec<u32> = self
+                    .stations
+                    .iter()
+                    .filter(|s| s.model.is_none() && s.info.is_some())
+                    .map(|s| s.id)
+                    .filter(|id| self.scenes.iter().any(|sc| sensors_seen(sc, *id) >= cfg.scene_min_sensors))
+                    .collect();
+                out.push(Event::Calibrated {
+                    reason,
+                    stations: reports,
+                    scenes: done.scenes,
+                    dropped: cal.dropped,
+                    tracker_up_error: cal.tracker_up_error,
+                    pending,
+                });
             }
         }
-        // Stations named and seen well that this round still couldn't place.
-        let pending: Vec<u32> = self
-            .stations
-            .iter()
-            .filter(|s| s.model.is_none() && s.info.is_some())
-            .map(|s| s.id)
-            .filter(|id| self.scenes.iter().any(|sc| sensors_seen(sc, *id) >= cfg.scene_min_sensors))
-            .collect();
-        out.push(Event::Calibrated {
-            reason,
-            stations: reports,
-            scenes: scenes.len(),
-            dropped: cal.dropped,
-            tracker_up_error: cal.tracker_up_error,
-            pending,
-        });
-        Ok(())
+        if let Some(r) = again {
+            self.calibrate(r, out);
+        }
     }
+}
+
+/// A sweep's hits at unwrapped device times, in time order.
+fn unwrap_hits(clock: &mut Clock, hits: &[SensorHits]) -> Vec<(i64, SensorHits)> {
+    let mut v: Vec<(i64, SensorHits)> = hits.iter().map(|h| (clock.unwrap(h.candidates[0].time), h.clone())).collect();
+    v.sort_by_key(|h| h.0);
+    v
 }
 
 /// Two scenes of one device with nearly the same angles on the sensors they
@@ -1479,11 +1869,16 @@ mod tests {
         /// `secs` at `pose`: IMU at 250 Hz, both stations sweeping both axes. `moving`:
         /// accel jitter, so the stillness detector ends the scene.
         fn hold(&mut self, pose: &Pose, secs: Real, moving: bool) {
+            self.hold_jitter(pose, secs, if moving { 0.03 } else { 0.0 });
+        }
+
+        /// As `hold`, the accelerometer norm alternating ±`amp` (g) sample to sample.
+        fn hold_jitter(&mut self, pose: &Pose, secs: Real, amp: Real) {
             let up = pose.rot.conj().rotate(Vec3::new(0.0, 0.0, 1.0));
             let n = (secs * 250.0) as u32;
             for i in 0..n {
                 self.t = self.t.wrapping_add(DT);
-                let jitter = if moving && i % 2 == 0 { 1.03 } else if moving { 0.97 } else { 1.0 };
+                let jitter = if i % 2 == 0 { 1.0 + amp } else { 1.0 - amp };
                 self.k.push(Input::Imu { dev: self.dev, time: self.t, accel_g: up.scale(jitter), gyro: Vec3::ZERO }, &mut self.out);
                 let di = self.k.devices.iter().position(|d| d.id == self.dev).unwrap();
                 for (slot, st) in [(0u8, self.c.clone()), (1u8, self.b.clone())] {
@@ -1526,6 +1921,174 @@ mod tests {
                 _ => None,
             }) == Some(true)
         }
+    }
+
+    impl Sim {
+        /// As `new`, slow solves handed out (KernelConfig::defer_solves).
+        fn deferred(auto_calibrate: bool) -> Sim {
+            let mut sim = Sim::new(auto_calibrate);
+            sim.k.cfg.defer_solves = true;
+            sim
+        }
+
+        /// The jobs handed out so far, taken out of `out`.
+        fn take_jobs(&mut self) -> Vec<SolveJob> {
+            let mut jobs = Vec::new();
+            let mut rest = Vec::new();
+            for e in self.out.drain(..) {
+                match e {
+                    Event::Solve(j) => jobs.push(j),
+                    e => rest.push(e),
+                }
+            }
+            self.out = rest;
+            jobs
+        }
+
+        /// Runs `jobs` (as a worker would) and pushes their results back.
+        fn finish(&mut self, jobs: Vec<SolveJob>) {
+            for j in jobs {
+                let r = run_job(j);
+                self.k.push(Input::Solved(r), &mut self.out);
+            }
+        }
+
+        fn started(&self) -> usize {
+            self.out.iter().filter(|e| matches!(e, Event::TrackingStarted { .. })).count()
+        }
+
+        fn lost(&self) -> Vec<TrackLoss> {
+            self.out.iter().filter_map(|e| if let Event::TrackingLost { reason, .. } = e { Some(*reason) } else { None }).collect()
+        }
+    }
+
+    /// The P4 (PixieLamp2, 2026-11-17): a pose bootstrap took ~1.5 s inline, the light of
+    /// that stretch came after it, and the fresh track was lost (NoLight) the moment it
+    /// started. Deferred, light keeps coming in while the solve is out, and the track it
+    /// starts takes that light.
+    #[test]
+    fn a_deferred_bootstrap_starts_a_track_that_has_the_light_since() {
+        let mut sim = Sim::deferred(false);
+        let p = table();
+        sim.hold(&p, 0.1, false);
+        let jobs: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "start").collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(sim.started(), 0);
+        // 1.2 s of light and IMU while it's solved, and no second bootstrap meanwhile.
+        sim.hold(&p, 1.2, false);
+        assert!(sim.take_jobs().iter().all(|j| j.kind() != "start"));
+        sim.finish(jobs);
+        assert_eq!(sim.started(), 1);
+        // Right away a pose at the newest light, where the tracker is.
+        let (time, pos) = sim
+            .out
+            .iter()
+            .rev()
+            .find_map(|e| if let Event::Pose { time, world_from_body, .. } = e { Some((*time, world_from_body.pos)) } else { None })
+            .expect("no pose from the backlog");
+        assert!((sim.t as i64 - time).abs() <= 2 * DT as i64, "pose at {} vs now {}", time, sim.t);
+        assert!(pos.sub(p.pos).norm() < 0.01, "{:?}", pos);
+        sim.hold(&p, 1.5, false);
+        assert!(sim.lost().is_empty(), "{:?}", sim.lost());
+    }
+
+    #[test]
+    fn a_deferred_bootstrap_out_too_long_is_given_up_for_a_fresh_one() {
+        let mut sim = Sim::deferred(false);
+        let p = table();
+        sim.hold(&p, 0.1, false);
+        let old: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "start").collect();
+        assert_eq!(old.len(), 1);
+        // More light than max_backlog keeps (2 sweeps per IMU sample here).
+        sim.hold(&p, 2.0, false);
+        let fresh: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "start").collect();
+        assert_eq!(fresh.len(), 1, "no fresh bootstrap after giving up");
+        sim.finish(old);
+        assert_eq!(sim.started(), 0, "a given-up bootstrap started a track");
+        sim.finish(fresh);
+        assert_eq!(sim.started(), 1);
+        sim.hold(&p, 0.5, false);
+        assert!(sim.lost().is_empty(), "{:?}", sim.lost());
+    }
+
+    /// a_station_named_later_joins_while_the_tracker_stays_put with the solves out (each
+    /// back a little later, as from a worker).
+    #[test]
+    fn deferred_calibrations_place_a_station_named_later() {
+        let mut sim = Sim::deferred(true);
+        let p = table();
+        let mut run_out = |sim: &mut Sim| {
+            for _ in 0..6 {
+                let jobs = sim.take_jobs();
+                if jobs.is_empty() {
+                    break;
+                }
+                sim.hold(&p, 0.2, false);
+                sim.finish(jobs);
+            }
+        };
+        sim.scene(&p);
+        run_out(&mut sim);
+        assert!(sim.calibrations().iter().all(|c| !c.1.contains(&B)));
+        sim.name_b();
+        sim.scene(&p);
+        run_out(&mut sim);
+        let cals = sim.calibrations();
+        assert!(cals.iter().any(|c| c.0 == CalibrationReason::NewStation && c.1.contains(&C) && c.1.contains(&B)), "{:?}", cals);
+        assert!(sim.b_placed());
+    }
+
+    #[test]
+    fn a_deferred_calibration_the_stations_moved_under_runs_again() {
+        let mut sim = Sim::deferred(true);
+        let p = table();
+        sim.scene(&p);
+        let early = sim.take_jobs();
+        sim.finish(early);
+        // B named: the next scene places it.
+        sim.name_b();
+        sim.scene(&p);
+        let jobs: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "calibrate").collect();
+        assert_eq!(jobs.len(), 1);
+        // A station placed again meanwhile (another host's calibration, say).
+        let mut cov = Mat::zeros(6, 6);
+        for i in 0..6 {
+            cov[(i, i)] = 1e-6;
+        }
+        let c = sim.c.world_from_station;
+        sim.k.push(Input::StationPrior { id: C, world_from_station: c, cov, cal: Some(cal()) }, &mut sim.out);
+        let before = sim.calibrations().len();
+        sim.finish(jobs);
+        assert_eq!(sim.calibrations().len(), before, "a stale calibration was applied");
+        let again: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "calibrate").collect();
+        assert_eq!(again.len(), 1, "it didn't run again");
+        sim.finish(again);
+        assert_eq!(sim.calibrations().len(), before + 1);
+        assert!(sim.b_placed());
+    }
+
+    /// A tracker at rest whose accelerometer reads right at `still_accel` (PixieLamp2's
+    /// Vive Tracker 3.0: 0.0039-0.0041 g): the still stretch is one scene, not a restart
+    /// every time the noise crosses the threshold.
+    #[test]
+    fn accelerometer_noise_at_the_threshold_still_makes_a_scene() {
+        let mut sim = Sim::new(false);
+        let p = table();
+        sim.hold_jitter(&p, 0.6, 0.0035);
+        for _ in 0..8 {
+            sim.hold_jitter(&p, 0.2, 0.0035);
+            sim.hold_jitter(&p, 0.2, 0.0045);
+        }
+        sim.hold(&p, 0.3, true);
+        assert_eq!(sim.k.scenes.len(), 1, "the stretch made no scene");
+        // Past the margin it is moving: no scene from that.
+        let mut sim = Sim::new(false);
+        sim.hold_jitter(&p, 0.6, 0.0035);
+        for _ in 0..8 {
+            sim.hold_jitter(&p, 0.2, 0.0035);
+            sim.hold_jitter(&p, 0.2, 0.0080);
+        }
+        assert_eq!(sim.k.scenes.len(), 0, "shaking made a scene");
     }
 
     fn table() -> Pose {
