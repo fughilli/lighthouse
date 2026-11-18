@@ -403,6 +403,8 @@ enum Done {
 struct StartWork {
     dev: DeviceId,
     model: TrackerModel,
+    /// The stations it solves against (ids, in `models` order).
+    ids: Vec<u32>,
     models: Vec<StationModel>,
     cands: Vec<CandidateObs>,
     up: Option<Vec3>,
@@ -1633,7 +1635,7 @@ impl Kernel {
         // fresh lock ~2 cm off while a swing came to rest).
         let up = d.last_imu.filter(|x| crate::math::fabs(x.1.norm() - 1.0) < 0.05 && x.2.norm() < 0.5).map(|x| x.1);
         let t = d.last_imu.map_or(0, |x| x.0);
-        let work = StartWork { dev: d.id, model: d.model.clone(), models, cands, up, solve: cfg.solve, t, stations_gen: self.stations_gen };
+        let work = StartWork { dev: d.id, model: d.model.clone(), ids, models, cands, up, solve: cfg.solve, t, stations_gen: self.stations_gen };
         self.dispatch(Work::Start(work), out);
     }
 
@@ -1649,8 +1651,16 @@ impl Kernel {
         d.start_pending = None;
         let backlog = core::mem::take(&mut d.backlog);
         let Some(sol) = sol else { return };
-        if w.stations_gen != self.stations_gen || d.track.is_some() {
-            return; // solved against stations that have moved since
+        if d.track.is_some() {
+            return;
+        }
+        // Solved against stations that have moved (or gone) since: for another world. Only
+        // the ones it used count: a station that comes and goes out of view (lhd sending
+        // one this tracker never sees, the P4 dropping it again) left every bootstrap
+        // stale, a fresh one every 1.5 s, and the tracker never tracked again.
+        let current = |id: u32| self.stations.iter().find(|s| s.id == id).and_then(|s| s.model.as_ref());
+        if w.stations_gen != self.stations_gen && !w.ids.iter().zip(&w.models).all(|(id, m)| current(*id) == Some(m)) {
+            return;
         }
         if !(sol.rms < 2e-3) || sol.inliers < 8 || sol.inliers * 3 < sol.obs * 2 {
             return;
@@ -2519,6 +2529,35 @@ mod tests {
         assert!(pos.sub(p.pos).norm() < 0.01, "{:?}", pos);
         sim.hold(&p, 1.5, false);
         assert!(sim.lost().is_empty(), "{:?}", sim.lost());
+    }
+
+    /// PixieLamp2 adopting lhd's stations: lhd sent one this tracker never sees every
+    /// second, the P4 dropped it as unseen in between, and every bootstrap (1.5 s out)
+    /// came back stale. A station the bootstrap didn't use coming or going doesn't matter.
+    #[test]
+    fn a_deferred_bootstrap_survives_an_unrelated_station_coming_and_going() {
+        let mut sim = Sim::deferred(false);
+        let p = table();
+        sim.hold(&p, 0.1, false);
+        let jobs: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "start").collect();
+        assert_eq!(jobs.len(), 1);
+        let mut cov = Mat::zeros(6, 6);
+        for i in 0..6 {
+            cov[(i, i)] = 1e-6;
+        }
+        let elsewhere = station(Vec3::new(-3.0, -3.0, 2.0)).world_from_station;
+        sim.k.push(Input::StationPrior { id: 0x0FF1CE, world_from_station: elsewhere, cov: cov.clone(), cal: Some(cal()) }, &mut sim.out);
+        sim.hold(&p, 0.5, false);
+        sim.finish(jobs);
+        assert_eq!(sim.started(), 1, "an unrelated station made the bootstrap stale");
+        // One it did use moving does.
+        let mut sim = Sim::deferred(false);
+        sim.hold(&p, 0.1, false);
+        let jobs: Vec<SolveJob> = sim.take_jobs().into_iter().filter(|j| j.kind() == "start").collect();
+        let moved = station(Vec3::new(2.5, -1.0, 2.0)).world_from_station;
+        sim.k.push(Input::StationPrior { id: C, world_from_station: moved, cov, cal: Some(cal()) }, &mut sim.out);
+        sim.finish(jobs);
+        assert_eq!(sim.started(), 0, "a bootstrap against a moved station started a track");
     }
 
     #[test]
