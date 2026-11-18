@@ -169,6 +169,12 @@ pub struct KernelConfig {
     pub still_gyro: Real,
     pub still_accel: Real,
     pub still_window: Real,
+    /// A scene (still stretch for calibration) ends only once the accelerometer spread
+    /// passes `still_accel` times this. A tracker at rest can read right at `still_accel`
+    /// (a Vive Tracker 3.0 on the P4: 0.0040 g); without the margin its scenes restarted a
+    /// few times a second and never reached `scene_min`, so nothing was calibrated. The
+    /// filter's still updates keep the strict thresholds (a slow carry isn't still).
+    pub still_exit: Real,
     /// A still stretch becomes a scene after this long (s); one scene is cut
     /// at most this long.
     pub scene_min: Real,
@@ -245,6 +251,7 @@ impl Default for KernelConfig {
             still_gyro: 0.02,
             still_accel: 0.004,
             still_window: 0.3,
+            still_exit: 1.5,
             scene_min: 1.0,
             scene_max: 4.0,
             max_scenes: 16,
@@ -533,6 +540,10 @@ struct StillDetector {
     acc: VecDeque<(i64, Real)>,
     still: bool,
     since: i64,
+    /// Still for collecting a scene: as `still`, but once still it takes `still_exit` times
+    /// the accelerometer threshold to end (see KernelConfig::still_exit).
+    scene_still: bool,
+    scene_since: i64,
 }
 
 struct Cluster {
@@ -831,15 +842,29 @@ impl Kernel {
         let asd = crate::math::sqrt(d.still.acc.iter().map(|x| (x.1 - am) * (x.1 - am)).sum::<Real>() / n);
         let full = d.still.gyro.front().map_or(false, |x| x.0 <= t - w * 9 / 10);
         let still = full && g < cfg.still_gyro && asd < cfg.still_accel;
+        let k = if d.still.scene_still { cfg.still_exit } else { 1.0 };
+        let scene_still = full && g < cfg.still_gyro && asd < cfg.still_accel * k;
+        let mut scene_ended = false;
+        if scene_still != d.still.scene_still {
+            d.still.scene_still = scene_still;
+            d.still.scene_since = t;
+            scene_ended = !scene_still;
+        }
         if still != d.still.still {
             d.still.still = still;
             d.still.since = t;
             out.push(Event::Still { dev, still });
             if !still {
-                self.finish_scene(di, out);
+                if scene_ended {
+                    self.finish_scene(di, out);
+                }
                 return;
             }
         }
+        if scene_ended {
+            self.finish_scene(di, out);
+        }
+        let d = &mut self.devices[di];
         let d = &mut self.devices[di];
         // In the dark (no hit used for coast_after): dead reckon on the IMU, judged on the
         // IMU clock (no sweep comes while both stations are blocked).
@@ -901,12 +926,12 @@ impl Kernel {
                 d.window = UpdateStats::default();
             }
         }
-        if still {
+        if scene_still {
             if let Some(sb) = d.scene.as_mut() {
                 sb.acc_sum = sb.acc_sum.add(accel_g);
                 sb.acc_n += 1;
             }
-            let dur = (t - d.still.since) as Real / TPS;
+            let dur = (t - d.still.scene_since) as Real / TPS;
             if d.scene.is_none() && dur >= 0.3 {
                 d.scene = Some(SceneBuilder { start: t, clusters: Vec::new(), acc_sum: Vec3::ZERO, acc_n: 0 });
             }
@@ -914,7 +939,7 @@ impl Kernel {
                 self.finish_scene(di, out);
                 // Keep collecting the next scene only if this stays still a while.
                 let d = &mut self.devices[di];
-                d.still.since = t;
+                d.still.scene_since = t;
             }
         }
     }
@@ -1844,11 +1869,16 @@ mod tests {
         /// `secs` at `pose`: IMU at 250 Hz, both stations sweeping both axes. `moving`:
         /// accel jitter, so the stillness detector ends the scene.
         fn hold(&mut self, pose: &Pose, secs: Real, moving: bool) {
+            self.hold_jitter(pose, secs, if moving { 0.03 } else { 0.0 });
+        }
+
+        /// As `hold`, the accelerometer norm alternating ±`amp` (g) sample to sample.
+        fn hold_jitter(&mut self, pose: &Pose, secs: Real, amp: Real) {
             let up = pose.rot.conj().rotate(Vec3::new(0.0, 0.0, 1.0));
             let n = (secs * 250.0) as u32;
             for i in 0..n {
                 self.t = self.t.wrapping_add(DT);
-                let jitter = if moving && i % 2 == 0 { 1.03 } else if moving { 0.97 } else { 1.0 };
+                let jitter = if i % 2 == 0 { 1.0 + amp } else { 1.0 - amp };
                 self.k.push(Input::Imu { dev: self.dev, time: self.t, accel_g: up.scale(jitter), gyro: Vec3::ZERO }, &mut self.out);
                 let di = self.k.devices.iter().position(|d| d.id == self.dev).unwrap();
                 for (slot, st) in [(0u8, self.c.clone()), (1u8, self.b.clone())] {
@@ -2035,6 +2065,30 @@ mod tests {
         sim.finish(again);
         assert_eq!(sim.calibrations().len(), before + 1);
         assert!(sim.b_placed());
+    }
+
+    /// A tracker at rest whose accelerometer reads right at `still_accel` (PixieLamp2's
+    /// Vive Tracker 3.0: 0.0039-0.0041 g): the still stretch is one scene, not a restart
+    /// every time the noise crosses the threshold.
+    #[test]
+    fn accelerometer_noise_at_the_threshold_still_makes_a_scene() {
+        let mut sim = Sim::new(false);
+        let p = table();
+        sim.hold_jitter(&p, 0.6, 0.0035);
+        for _ in 0..8 {
+            sim.hold_jitter(&p, 0.2, 0.0035);
+            sim.hold_jitter(&p, 0.2, 0.0045);
+        }
+        sim.hold(&p, 0.3, true);
+        assert_eq!(sim.k.scenes.len(), 1, "the stretch made no scene");
+        // Past the margin it is moving: no scene from that.
+        let mut sim = Sim::new(false);
+        sim.hold_jitter(&p, 0.6, 0.0035);
+        for _ in 0..8 {
+            sim.hold_jitter(&p, 0.2, 0.0035);
+            sim.hold_jitter(&p, 0.2, 0.0080);
+        }
+        assert_eq!(sim.k.scenes.len(), 0, "shaking made a scene");
     }
 
     fn table() -> Pose {
