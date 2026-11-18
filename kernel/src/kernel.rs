@@ -2522,7 +2522,7 @@ mod tests {
     fn deferred_calibrations_place_a_station_named_later() {
         let mut sim = Sim::deferred(true);
         let p = table();
-        let mut run_out = |sim: &mut Sim| {
+        let run_out = |sim: &mut Sim| {
             for _ in 0..6 {
                 let jobs = sim.take_jobs();
                 if jobs.is_empty() {
