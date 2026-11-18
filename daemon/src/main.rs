@@ -241,6 +241,8 @@ fn event_json(e: &Event, mgr: &DeviceManager) -> Option<Value> {
             json!({"type":"pose","serial":serial(*dev),"t":*time as f64 / 48e6,"p":p,"q":q,
                    "v":[velocity.x,velocity.y,velocity.z],"cov":cov.d,"used":used,"gated":gated})
         }
+        // lhd solves inline (KernelConfig::defer_solves off).
+        Event::Solve(_) => return None,
     })
 }
 
