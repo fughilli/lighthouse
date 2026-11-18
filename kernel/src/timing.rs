@@ -209,11 +209,15 @@ impl WidthCal {
     /// One cycle's evidence for each whole-step shift (-1, 0, +1). Under the
     /// right shift: both syncs of a cycle name the same axis and exactly one
     /// skips; per station, the skip bit toggles exactly when the axis goes
-    /// from 1 back to 0 (b/c sequence 4,5,0,1); a lone station never skips.
+    /// from 1 back to 0 (b/c sequence 4,5,0,1).
     ///
-    /// A lone station only rules a wrong shift out when its sync would read as a skip,
-    /// one cycle in four, so the right shift outvotes the next only 4:3; it's taken
-    /// instead once it has (almost) never been contradicted and both others often.
+    /// A lone station (one sync per cycle) is either in mode A, never skipping, or a
+    /// master in mode B with no slave on C: it still runs the b/c sequence, skipping two
+    /// cycles in four that nobody sweeps. Its own sequence is the check: the axis
+    /// alternates, and the skip bit is either always clear or follows the b/c sequence.
+    /// That rules a wrong shift out only about one cycle in four, so the right shift
+    /// outvotes the next only 4:3; it's taken instead once it has (almost) never been
+    /// contradicted and both others often.
     fn vote(&mut self, raw: [Option<i32>; 2], prev_raw: [Option<i32>; 2]) {
         if self.shift.is_some() {
             return;
@@ -224,7 +228,8 @@ impl WidthCal {
             let mut ok = true;
             match (code(raw[0]), code(raw[1])) {
                 (Some(a), Some(b)) => ok &= a.axis == b.axis && a.skip != b.skip,
-                (Some(a), None) | (None, Some(a)) => ok &= !a.skip,
+                // A lone sync: judged against its own previous one below.
+                (Some(_), None) | (None, Some(_)) => {}
                 (None, None) => ok = false,
             }
             for slot in 0..2 {
@@ -232,9 +237,13 @@ impl WidthCal {
                     ok = false;
                 }
                 if let (Some(a), Some(p)) = (code(raw[slot]), code(prev_raw[slot])) {
+                    let toggled = a.skip != p.skip;
+                    let bc = if p.axis == 1 && a.axis == 0 { toggled } else { !toggled };
                     if both {
-                        let toggled = a.skip != p.skip;
-                        ok &= if p.axis == 1 && a.axis == 0 { toggled } else { !toggled };
+                        ok &= bc;
+                    } else {
+                        // Mode A (never skips) or a lone mode-B master (the b/c sequence).
+                        ok &= a.axis != p.axis && (bc || (!a.skip && !p.skip));
                     }
                 }
             }
@@ -1196,6 +1205,47 @@ mod tests {
             out.iter().filter_map(|e| if let TimingEvent::Sweep(s) = e { Some(s) } else { None }).collect();
         assert!(sweeps.len() > data.len() / 2, "{} sweeps, {:?}", sweeps.len(), t.stats);
         assert!(sweeps.iter().all(|s| s.slot == 0));
+        for axis in 0..2 {
+            assert!(sweeps.iter().any(|s| s.axis == axis));
+        }
+        assert!(out.iter().any(|e| matches!(e, TimingEvent::Station { slot: 0, .. })), "no OOTX station");
+    }
+
+    /// A lone master in mode B (its slave on C absent): one sync per cycle in slot 0 on the
+    /// b/c sequence, so it skips two cycles in four and nobody sweeps those (PixieLamp2,
+    /// 2026-11-17: a station left on B alone never got its widths learned, so no OOTX and
+    /// no sweeps).
+    fn lone_b_stream(cycles: u32, data: &[bool]) -> Vec<Pulse> {
+        let mut v = Vec::new();
+        let base: u32 = 4_294_000_000;
+        for k in 0..cycles {
+            let t0 = base.wrapping_add(k * CYCLE_TICKS);
+            let bit = data.get(k as usize).copied().unwrap_or(false);
+            let c = SyncCode { skip: (k / 2) % 2 == 1, data: bit, axis: (k % 2) as u8 };
+            for s in 0..8u8 {
+                v.push(Pulse { sensor: s, start: t0.wrapping_add(s as u32 * 3), len: c.nominal_ticks() + 350 });
+            }
+            if !c.skip {
+                for s in 0..6u8 {
+                    v.push(Pulse { sensor: s, start: t0.wrapping_add(200_000 + s as u32 * 1_000 - 400), len: 800 });
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn lone_mode_b_station_locks_decodes_and_sweeps() {
+        let mut data = ootx_frame(0x1234_5678);
+        data.extend(ootx_frame(0x1234_5678));
+        let (out, t) = run(&lone_b_stream(data.len() as u32 + 20, &data), TimingConfig::default());
+        assert_eq!(t.stats.locks, 1, "{:?}", t.stats);
+        assert_eq!(t.stats.lock_losses, 0, "{:?}", t.stats);
+        let sweeps: Vec<&Sweep> =
+            out.iter().filter_map(|e| if let TimingEvent::Sweep(s) = e { Some(s) } else { None }).collect();
+        // Half the cycles sweep.
+        assert!(sweeps.len() > data.len() / 3, "{} sweeps, {:?}", sweeps.len(), t.stats);
+        assert!(sweeps.iter().all(|s| s.slot == 0 && s.hits.len() == 6));
         for axis in 0..2 {
             assert!(sweeps.iter().any(|s| s.axis == axis));
         }
