@@ -4,8 +4,8 @@
 //! a running daemon.
 
 pub const USAGE: &str = "\
-usage: lhd [--replay REC.gz [--speed X]] [--calibration FILE.json] [--record FILE.rec.gz]
-           [--host-clock [--stream-sweeps]] [--pose-timing]
+usage: lhd [--replay REC.gz [--speed X]] [--calibration FILE.json [--load-calibration]]
+           [--record FILE.rec.gz] [--host-clock [--stream-sweeps]] [--pose-timing]
        lhd --help | --version
 
 Tracks Lighthouse 1.0 devices and prints JSON lines on stdout; commands come
@@ -13,7 +13,9 @@ in as JSON lines on stdin. Without --replay it opens the USB receivers (hidapi).
 
   --replay REC.gz        replay a recording instead of the live receivers
   --speed X              replay speed (default 1.0; needs --replay)
-  --calibration FILE     load station calibration from FILE, save new ones to it
+  --calibration FILE     save each station calibration to FILE
+  --load-calibration     also start from FILE's stations (default: solve them afresh, so
+                         stations moved or switched off since are never assumed)
   --record FILE          record raw traffic to FILE (.rec.gz)
   --host-clock           map device clocks onto report timestamps (Input::Clock)
   --stream-sweeps        stream each sweep's hits as they come
@@ -27,6 +29,7 @@ pub struct Options {
     pub replay: Option<String>,
     pub speed: f64,
     pub calibration: Option<String>,
+    pub load_calibration: bool,
     pub record: Option<String>,
     pub host_clock: bool,
     pub stream_sweeps: bool,
@@ -83,6 +86,7 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
                 o.speed = v.parse().ok().filter(|s: &f64| s.is_finite() && *s > 0.0).ok_or_else(|| format!("--speed: not a positive number: {:?}", v))?;
                 speed_given = true;
             }
+            "--load-calibration" => o.load_calibration = flag(name)?,
             "--host-clock" => o.host_clock = flag(name)?,
             "--stream-sweeps" => o.stream_sweeps = flag(name)?,
             "--pose-timing" => o.pose_timing = flag(name)?,
@@ -92,6 +96,9 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
     }
     if speed_given && o.replay.is_none() {
         return Err("--speed needs --replay".into());
+    }
+    if o.load_calibration && o.calibration.is_none() {
+        return Err("--load-calibration needs --calibration".into());
     }
     Ok(Command::Run(o))
 }
@@ -125,6 +132,8 @@ mod tests {
         assert_eq!(o.calibration.as_deref(), Some("c.json"));
         assert_eq!(o.record.as_deref(), Some("o.rec.gz"));
         assert!(o.host_clock && o.stream_sweeps && o.pose_timing);
+        assert!(!o.load_calibration, "a saved calibration is only loaded when asked");
+        assert!(run(&["--calibration", "c.json", "--load-calibration"]).load_calibration);
     }
 
     #[test]
@@ -137,6 +146,7 @@ mod tests {
             (&["--replay", "r.gz", "--speed", "fast"], "not a positive number"),
             (&["--speed", "2"], "needs --replay"),
             (&["--host-clock=yes"], "takes no value"),
+            (&["--load-calibration"], "needs --calibration"),
             (&["stray"], "unexpected argument"),
         ] {
             let e = parse(a).expect_err(&format!("{:?}", a));

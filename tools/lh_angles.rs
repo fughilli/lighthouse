@@ -59,6 +59,7 @@ fn emit(w: &mut impl Write, out: &mut Vec<TimingEvent>) {
             TimingEvent::Locked { phase, inliers } => writeln!(w, "LOCKED {} {}", phase, inliers).unwrap(),
             TimingEvent::LockLost { reason } => writeln!(w, "LOST {:?}", reason).unwrap(),
             TimingEvent::OotxError { slot } => writeln!(w, "OOTXERR {}", slot).unwrap(),
+            TimingEvent::SlotShifted => writeln!(w, "SLOTSHIFT").unwrap(),
         }
     }
 }

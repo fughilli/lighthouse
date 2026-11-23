@@ -149,6 +149,10 @@ pub enum TimingEvent {
     /// A station's OOTX packet, decoded from the data bits of its slot.
     Station { slot: u8, info: StationInfo },
     OotxError { slot: u8 },
+    /// The lock had the slave's sync for slot 0 (it locked while only the slave was in
+    /// view) and the master's came one slot earlier, cycle after cycle: the lock moved one
+    /// slot back. What it called slot 0 is slot 1 from here; its sweeps go on.
+    SlotShifted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +307,8 @@ pub struct TimingStats {
     pub lock_losses: u64,
     /// A proven slot's OOTX decoder restarted after framing errors (the lock kept).
     pub ootx_restarts: u64,
+    /// Locks moved one slot back (TimingEvent::SlotShifted).
+    pub slot_shifts: u64,
 }
 
 /// Lock state: the current cycle starts at `origin + origin_frac` (unwrapped
@@ -790,8 +796,31 @@ impl Timing {
         } else if ootx_bad {
             self.drop_lock(LockLoss::Ootx, out);
         } else if lock.early_syncs >= 8 {
-            self.drop_lock(LockLoss::SlotPhase, out);
+            self.shift_slot(out);
         }
+    }
+
+    /// The master's sync comes one slot before what this lock called slot 0: move the lock
+    /// back a slot, and what was slot 0's (the slave's code, OOTX decoder) to slot 1. Not
+    /// a lock loss: the slave's sweeps keep going (dropping the lock cost them ~0.1 s, a
+    /// tracked pose went uncertain for it).
+    fn shift_slot(&mut self, out: &mut Vec<TimingEvent>) {
+        let Some(lock) = self.lock.as_mut() else { return };
+        lock.origin -= SLOT_TICKS as i64;
+        lock.early_syncs = 0;
+        lock.last_code = [None, lock.last_code[0]];
+        self.prev_raw = [None, self.prev_raw[0]];
+        let slave = core::mem::replace(&mut self.ootx[0], OotxDecoder::new());
+        self.ootx[1] = slave;
+        self.ootx_errors = [0, self.ootx_errors[0]];
+        self.ootx_good = [0, self.ootx_good[0]];
+        self.cycle_sync = [Vec::new(), Vec::new()];
+        self.cycle_sweep.clear();
+        self.sweep_sent = 0;
+        self.sweep_parts = 0;
+        self.sweeper = None;
+        self.stats.slot_shifts += 1;
+        out.push(TimingEvent::SlotShifted);
     }
 
     /// Close to a station a sync flash saturates and stretches; while locked,
